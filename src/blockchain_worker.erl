@@ -830,17 +830,41 @@ maybe_sync_blocks(#state{blockchain = Chain} = State) ->
 snapshot_sync(_Hash, _Height, #state{sync_pid = Pid} = State) when Pid /= undefined ->
     State;
 snapshot_sync(Hash, Height, #state{swarm_tid = SwarmTID} = State) ->
-    case get_random_peer(SwarmTID) of
-        no_peers ->
-            lager:info("no snapshot peers yet"),
-            %% try again later when there's peers
-            reset_sync_timer(State#state{snapshot_info = {Hash, Height}, mode = snapshot});
-        RandomPeer ->
-            {Pid, Ref} = start_snapshot_sync(Hash, Height, RandomPeer, State),
-            lager:info("snapshot_sync starting ~p ~p", [Pid, Ref]),
-            State#state{sync_pid = Pid, sync_ref = Ref, mode = snapshot,
-                        snapshot_info = {Hash, Height}}
+    LoadSnapOSVar = get_boolean_os_var_or_default("LOAD_SNAPSHOT", true),
+    case LoadSnapOSVar of
+        true ->
+            case get_random_peer(SwarmTID) of
+                no_peers ->
+                    lager:info("no snapshot peers yet"),
+                    %% try again later when there's peers
+                    reset_sync_timer(State#state{snapshot_info = {Hash, Height}, mode = snapshot});
+                RandomPeer ->
+                    {Pid, Ref} = start_snapshot_sync(Hash, Height, RandomPeer, State),
+                    lager:info("snapshot_sync starting ~p ~p", [Pid, Ref]),
+                    State#state{sync_pid = Pid, sync_ref = Ref, mode = snapshot,
+                                snapshot_info = {Hash, Height}}
+            end;
+        false ->
+            lager:debug("Not loading snapshot because 'LOAD_SNAPSHOT' is set false"),
+            State
     end.
+
+%% @doc If this os environment variable is set and is a "truthy" value,
+%% return `true'; otherwise, `false'. Unset variables return the default value.
+%%
+%% False values are "0", "no", "false".  True values are any value that aren't
+%% listed as explicitly false.
+get_boolean_os_var_or_default(VarName, Default) ->
+    case os:getenv(VarName, undefined) of
+        "0" -> false;
+        "no" -> false;
+        "NO" -> false;
+        "FALSE" -> false;
+        "false" -> false;
+        undefined -> Default;
+        _ -> true
+    end.
+
 
 reset_ledger_to_snap(Hash, Height, State) ->
     lager:info("clearing the ledger now"),
