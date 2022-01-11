@@ -3816,6 +3816,8 @@ cache_get(Ledger, {Name, DB, CF}, Key, Options) ->
                                     catch ets:insert(Cache, {{Name, Key}, {'__cached', Value}});
                                 {default, <<"$var_", _/binary>>} ->
                                     catch ets:insert(Cache, {{Name, Key}, {'__cached', Value}});
+                                {h3dex, <<"population">>} ->
+                                    catch ets:insert(Cache, {{Name, Key}, {'__cached', Value}});
                                 _ ->
                                     ok
                             end,
@@ -4261,31 +4263,25 @@ count_gateways_in_hexes(Resolution, Ledger) ->
 random_targeting_hex(Entropy, Ledger) ->
     Lookup = xxhash:hash64(Entropy),
     H3CF = h3dex_cf(Ledger),
-    try cache_fold(Ledger, H3CF,
-                   fun({<<"random-", Max:64/integer-unsigned-big>>, <<H3:64/integer-unsigned-little>>}, none) ->
-                           Offset = Lookup rem Max +1,
-                           case Offset == Max of
-                               true ->
-                                   throw({result, H3});
-                               false ->
-                                   {ok, <<OtherH3:64/integer-unsigned-little>>} = cache_get(Ledger, H3CF, <<"random-", Offset:64/integer-unsigned-big>>, []),
-                                   throw({result, OtherH3})
-                           end;
-                      (_, none) ->
-                           none
-                   end, none, [
-                               {start, {seek, <<"random-ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ">>}}, reverse]) of
-        none ->
-            {error, no_populated_hexes}
-    catch
-        throw:{result, H3} ->
-            {ok, H3}
+    case cache_get(Ledger, H3CF, <<"population">>, []) of
+        {ok, <<0:32/integer-unsigned-little>>} ->
+            {error, no_populated_hexes};
+        {ok, <<Count:32/integer-unsigned-little>>} ->
+            Jump = Lookup rem Count,
+            {ok, <<Hex:64/integer-unsigned-little>>} = cache_get(Ledger, H3CF, <<"random-", Jump:32/integer-unsigned-big>>, []),
+            {ok, Hex};
+        not_found ->
+            {error, no_populated_hexes};
+        Error ->
+            Error
     end.
 
 build_random_hex_targeting_lookup(Resolution, Ledger) ->
     H3CF = h3dex_cf(Ledger),
-    cache_fold(Ledger, H3CF,
+    {_, Total} = cache_fold(Ledger, H3CF,
                fun({<<"random-", _/binary>>, _}, Acc) ->
+                       Acc;
+                  ({<<"population">>, _}, Acc) ->
                        Acc;
                  ({Key, _GWs}, {PrevHex, Count}=Acc) ->
                        H3 = key_to_h3(Key),
@@ -4296,7 +4292,7 @@ build_random_hex_targeting_lookup(Resolution, Ledger) ->
                                Acc;
                            false ->
                                %% new hex
-                               cache_put(Ledger, H3CF, <<"random-", Count:64/integer-unsigned-big>>, <<Hex:64/integer-unsigned-little>>),
+                               cache_put(Ledger, H3CF, <<"random-", Count:32/integer-unsigned-big>>, <<Hex:64/integer-unsigned-little>>),
                                {Hex, Count + 1}
                        end
                end, {0, 0}, [
@@ -4305,6 +4301,7 @@ build_random_hex_targeting_lookup(Resolution, Ledger) ->
                           {iterate_upper_bound, <<255, 255, 255, 255, 255, 255, 255>>}
                          ]
               ),
+    cache_put(Ledger, H3CF, <<"population">>, <<Total:32/integer-unsigned-little>>),
     ok.
 
 clean_random_hex_targeting_lookup(Ledger) ->
@@ -4320,6 +4317,7 @@ clean_random_hex_targeting_lookup(Ledger) ->
                           {iterate_upper_bound, <<"random-ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ">>}
                          ]
               ),
+    cache_delete(Ledger, H3CF, <<"population">>),
     {ok, Deleted}.
 
 
@@ -4362,8 +4360,14 @@ add_gw_to_hex(Hex, GWAddr, Ledger) ->
         not_found ->
             case count_gateways_in_hex(h3:parent(Hex, 5), Ledger) of
                 0 ->
-                    %% TODO add hex to random lookup set
-                    ok;
+                    %% populating a hex means we need to recalculate the set of populated
+                    %% hexes
+                    case blockchain:config(?poc_target_hex_parent_res, Ledger) of
+                        {ok, Res} ->
+                            build_random_hex_targeting_lookup(Ledger, Res);
+                        _ ->
+                            ok
+                    end;
                 _ ->
                     ok
             end,
@@ -4390,8 +4394,14 @@ remove_gw_from_hex(Hex, GWAddr, Ledger) ->
                 [] ->
                     case count_gateways_in_hex(h3:parent(Hex, 5), Ledger) of
                         0 ->
-                            %% TODO remove hex from random lookup set
-                            ok;
+                            %% removing a hex means we need to recalculate the set of populated
+                            %% hexes
+                            case blockchain:config(?poc_target_hex_parent_res, Ledger) of
+                                {ok, Res} ->
+                                    build_random_hex_targeting_lookup(Ledger, Res);
+                                _ ->
+                                    ok
+                            end;
                         _ ->
                             ok
                     end,
