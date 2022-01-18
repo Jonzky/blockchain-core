@@ -1233,8 +1233,22 @@ get_assumed_valid_height_and_hash() ->
      application:get_env(blockchain, assumed_valid_block_height, undefined)}.
 
 get_blessed_snapshot_height_and_hash() ->
-    {application:get_env(blockchain, blessed_snapshot_block_hash, undefined),
-     application:get_env(blockchain, blessed_snapshot_block_height, undefined)}.
+    Default = {application:get_env(blockchain, blessed_snapshot_block_hash, undefined),
+               application:get_env(blockchain, blessed_snapshot_block_height, undefined)},
+    case application:get_env(blockchain, fetch_latest_from_snap_source, true) of
+        true ->
+            BaseUrl = application:get_env(blockchain, snap_source_base_url, undefined),
+            try blockchain_worker:fetch_and_parse_latest_snapshot(BaseUrl) of
+                {Height, Hash} ->
+                    {Hash, Height}
+            catch _:_ ->
+                      Default
+            end;
+        _ ->
+            Default
+    end.
+
+
 
 get_quick_sync_height_and_hash(Mode) ->
 
