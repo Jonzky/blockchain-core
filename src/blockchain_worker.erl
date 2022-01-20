@@ -1239,7 +1239,7 @@ get_blessed_snapshot_height_and_hash() ->
         true ->
             BaseUrl = application:get_env(blockchain, snap_source_base_url, undefined),
             try blockchain_worker:fetch_and_parse_latest_snapshot(BaseUrl) of
-                {Height, Hash} ->
+                {Height, Hash} -> %% why is this reversed? lol
                     {Hash, Height}
             catch _:_ ->
                       Default
@@ -1247,8 +1247,6 @@ get_blessed_snapshot_height_and_hash() ->
         _ ->
             Default
     end.
-
-
 
 get_quick_sync_height_and_hash(Mode) ->
 
@@ -1316,15 +1314,15 @@ schedule_sync(State) ->
           end,
     State#state{sync_timer=Ref}.
 
-
 get_sync_mode(Blockchain) ->
     case application:get_env(blockchain, honor_quick_sync, false) of
         true ->
             case application:get_env(blockchain, quick_sync_mode, assumed_valid) of
                 assumed_valid -> {normal, undefined};
                 blessed_snapshot ->
-                    {ok, Hash} = application:get_env(blockchain, blessed_snapshot_block_hash),
-                    {ok, Height} = application:get_env(blockchain, blessed_snapshot_block_height),
+                    %% reconsider whether the latest-snap.json data is newer
+                    %% than whatever our current ledger height is
+                    {Hash, Height} = get_blessed_snapshot_height_and_hash(),
                     Autoload = application:get_env(blockchain, autoload, true),
                     case Blockchain of
                         undefined when Autoload == false ->
