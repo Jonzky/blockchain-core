@@ -848,15 +848,20 @@ reset_ledger_to_snap(Hash, Height, State) ->
     snapshot_sync(Hash, Height, State1).
 
 start_sync(#state{blockchain = Chain, swarm_tid = SwarmTID} = State) ->
-    case get_random_peer(SwarmTID) of
-        no_peers ->
-            %% try again later when there's peers
-            schedule_sync(State);
-        RandomPeer ->
-            {Pid, Ref} = start_block_sync(SwarmTID, Chain, RandomPeer, [], <<>>),
-            lager:info("new block sync starting with Pid: ~p, Ref: ~p, Peer: ~p",
-                       [Pid, Ref, RandomPeer]),
-            State#state{sync_pid = Pid, sync_ref = Ref}
+    case get_sync_mode(Chain) of
+        {normal, _} ->
+            case get_random_peer(SwarmTID) of
+                no_peers ->
+                    %% try again later when there's peers
+                    schedule_sync(State);
+                RandomPeer ->
+                    {Pid, Ref} = start_block_sync(SwarmTID, Chain, RandomPeer, [], <<>>),
+                    lager:info("new block sync starting with Pid: ~p, Ref: ~p, Peer: ~p",
+                               [Pid, Ref, RandomPeer]),
+                    State#state{sync_pid = Pid, sync_ref = Ref}
+            end;
+        {snapshot, {Hash, Height}} ->
+            snapshot_sync(Hash, Height, State)
     end.
 
 -spec get_random_peer(SwarmTID :: ets:tab()) -> no_peers | string().
