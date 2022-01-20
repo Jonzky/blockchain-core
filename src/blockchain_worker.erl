@@ -1227,8 +1227,14 @@ get_assumed_valid_height_and_hash() ->
      application:get_env(blockchain, assumed_valid_block_height, undefined)}.
 
 get_blessed_snapshot_height_and_hash() ->
-    {application:get_env(blockchain, blessed_snapshot_block_hash, undefined),
-     application:get_env(blockchain, blessed_snapshot_block_height, undefined)}.
+    case blockchain_utils:get_boolean_os_env_var("LOAD_SNAPSHOT", true) of
+        true ->
+            {application:get_env(blockchain, blessed_snapshot_block_hash, undefined),
+             application:get_env(blockchain, blessed_snapshot_block_height, undefined)};
+        false ->
+            lager:debug("LOAD_SNAPSHOT is false; returning undefined height and hash"),
+            {undefined, undefined}
+    end.
 
 get_quick_sync_height_and_hash(Mode) ->
 
@@ -1303,23 +1309,29 @@ get_sync_mode(Blockchain) ->
             case application:get_env(blockchain, quick_sync_mode, assumed_valid) of
                 assumed_valid -> {normal, undefined};
                 blessed_snapshot ->
-                    {ok, Hash} = application:get_env(blockchain, blessed_snapshot_block_hash),
-                    {ok, Height} = application:get_env(blockchain, blessed_snapshot_block_height),
-                    Autoload = application:get_env(blockchain, autoload, true),
-                    case Blockchain of
-                        undefined when Autoload == false ->
-                            {normal, undefined};
-                        undefined ->
-                            {snapshot, {Hash, Height}};
-                        {no_genesis, _} ->
-                            {snapshot, {Hash, Height}};
-                        _Chain ->
-                            {ok, CurrHeight} = blockchain:height(Blockchain),
-                            case CurrHeight >= Height - 1 of
-                                %% already loaded the snapshot
-                                true -> {normal, undefined};
-                                false -> {snapshot, {Hash, Height}}
-                            end
+                    case blockchain_utils:get_boolean_os_env_var("LOAD_SNAPSHOT", true) of
+                        true ->
+                            {ok, Hash} = application:get_env(blockchain, blessed_snapshot_block_hash),
+                            {ok, Height} = application:get_env(blockchain, blessed_snapshot_block_height),
+                            Autoload = application:get_env(blockchain, autoload, true),
+                            case Blockchain of
+                                undefined when Autoload == false ->
+                                    {normal, undefined};
+                                undefined ->
+                                    {snapshot, {Hash, Height}};
+                                {no_genesis, _} ->
+                                    {snapshot, {Hash, Height}};
+                                _Chain ->
+                                    {ok, CurrHeight} = blockchain:height(Blockchain),
+                                    case CurrHeight >= Height - 1 of
+                                        %% already loaded the snapshot
+                                        true -> {normal, undefined};
+                                        false -> {snapshot, {Hash, Height}}
+                                    end
+                            end;
+                        false ->
+                            lager:debug("LOAD_SNAPSHOT is false; returning normal sync mode"),
+                            {normal, undefined}
                     end
             end;
         false ->
