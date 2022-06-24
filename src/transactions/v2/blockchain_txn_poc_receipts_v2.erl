@@ -476,8 +476,8 @@ absorb(_POCVersion, Txn, Chain) ->
                         [update_participant_gateway(GWAddr, Height, Ledger) || GWAddr <- Participants];
                     _ ->
                         ok
-                end,
-                ok = blockchain_ledger_v1:delete_public_poc(OnionKeyHash, Ledger)
+                end
+                % ok = blockchain_ledger_v1:delete_public_poc(OnionKeyHash, Ledger)
         end
     catch throw:Reason ->
             {error, Reason};
