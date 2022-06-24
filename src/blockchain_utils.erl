@@ -11,7 +11,7 @@
 
 -export([
     shuffle_from_hash/2,
-    shuffle/1,
+    shuffle/1, shuffle/2,
     rand_from_hash/1, rand_state/1,
     normalize_float/1,
     challenge_interval/1,
@@ -41,6 +41,8 @@
     deterministic_subset/3,
     fold_condition_checks/1,
     get_boolean_os_env_var/2,
+    streaming_file_hash/1,
+    streaming_transform_iolist/2,
 
     %% exports for simulations
     free_space_path_loss/4,
@@ -55,7 +57,8 @@
     get_vars/2, get_var/2,
     var_cache_stats/0,
     teardown_var_cache/0,
-    init_var_cache/0
+    init_var_cache/0,
+    target_v_to_mod/1
 
 ]).
 
@@ -63,7 +66,7 @@
 -define(TRANSMIT_POWER, 28).
 -define(MAX_ANTENNA_GAIN, 6).
 -define(POC_PER_HOP_MAX_WITNESSES, 5).
-
+-define(BLOCK_READ_SIZE, 16*1024). % 16k
 
 -type zone_map() :: #{h3:index() => gateway_score_map()}.
 -type gateway_score_map() :: #{libp2p_crypto:pubkey_bin() => {blockchain_ledger_gateway_v2:gateway(), float()}}.
@@ -118,6 +121,18 @@ shuffle_from_hash(Hash, L) ->
 -spec shuffle([A]) -> [A].
 shuffle(Xs) ->
     [X || {_, X} <- lists:sort([{rand:uniform(), X} || X <- Xs])].
+
+-spec shuffle([A], rand:state()) -> {[A], rand:state()}.
+shuffle(Xs, RandState) ->
+    {Shuffled, RandState1} =
+        lists:foldl(
+          fun(X, {A, St}) ->
+                  {R, St1} = rand:uniform_s(St),
+                  {[{R, X} | A ], St1}
+          end, {[], RandState},
+          Xs),
+    {_Rands, Positions} = lists:unzip(lists:sort(Shuffled)),
+    {Positions, RandState1}.
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -194,7 +209,7 @@ pfind(F, ToDos, Timeout) ->
             Parent = self(),
             Workers = lists:foldl(
                 fun(Args, Acc) ->
-                    {Pid, _Ref} = 
+                    {Pid, _Ref} =
                         erlang:spawn_opt(
                             fun() ->
                                 Result = erlang:apply(F, Args),
@@ -219,7 +234,7 @@ pfind(F, ToDos, Timeout) ->
     after Timeout ->
         false
     end.
- 
+
 pfind_rcv(_Ref, Result, 0) ->
     Result;
 pfind_rcv(Ref, Result, Left) ->
@@ -400,7 +415,7 @@ get_pubkeybin_sigfun(Swarm) ->
     PubKeyBin = libp2p_crypto:pubkey_to_bin(PubKey),
     {PubKeyBin, SigFun}.
 
--spec icdf_select([{any(), float()}, ...], float()) -> {ok, any()} | {error, zero_weight}.
+-spec icdf_select([{any(), number()}, ...], float()) -> {ok, any()} | {error, zero_weight}.
 icdf_select(PopulationList, Rnd) ->
     Sum = lists:foldl(fun({_Node, Weight}, Acc) ->
                               Acc + Weight
@@ -430,7 +445,8 @@ icdf_select_([{_Node, Weight} | Tail], Rnd) ->
 
 -spec map_to_bitvector(#{pos_integer() => boolean()}) -> binary().
 map_to_bitvector(Map) ->
-    Sz = maps:size(Map),
+    %% grab the biggest index
+    Sz = lists:max([0 |maps:keys(Map)]),
     Int = lists:foldl(
             fun({ID, true}, Acc) ->
                     Acc bor (1 bsl (ID - 1));
@@ -630,6 +646,35 @@ is_truthy("no") -> false;
 is_truthy("n") -> false;
 is_truthy(_) -> true.
 
+-spec streaming_file_hash( File :: file:file_name() ) -> {ok, Hash :: binary()} | {error, Reason :: term()}.
+streaming_file_hash(File) ->
+    case file:open(File, [read, raw, binary]) of
+        {ok, FD} ->
+            RetVal = case do_hash(FD, crypto:hash_init(sha256)) of
+                         {error, _E} = Err -> Err;
+                         {ok, HashState} -> {ok, crypto:hash_final(HashState)}
+                     end,
+            file:close(FD),
+            RetVal;
+        {error, _E} = Err -> Err
+    end.
+
+do_hash(FD, HashState) ->
+    case file:read(FD, ?BLOCK_READ_SIZE) of
+        eof -> {ok, HashState};
+        {ok, Data} -> do_hash(FD, crypto:hash_update(HashState, Data));
+        {error, _E} = Err -> Err
+    end.
+
+streaming_transform_iolist(L, Fun) when is_list(L) ->
+    do_transform_iolist(L, 1, length(L)+1, Fun).
+
+do_transform_iolist(_L, Pos, End, Fun) when Pos >= End ->
+    Fun(eof),
+    ok;
+do_transform_iolist(L, Pos, End, Fun) ->
+    Fun(lists:sublist(L, Pos, 32000)),
+    do_transform_iolist(L, Pos+32000, End, Fun).
 
 majority(N) ->
     (N div 2) + 1.
@@ -678,11 +723,22 @@ var_cache_stats() ->
 
 -spec teardown_var_cache() -> ok.
 teardown_var_cache() ->
-    e2qc:teardown(?VAR_CACHE).
+    e2qc:teardown(?VAR_CACHE),
+    ok.
 
 init_var_cache() ->
     %% TODO could pull cache settings from app env here
     e2qc:setup(?VAR_CACHE, []).
+
+-spec target_v_to_mod({error, not_found} | {ok, integer()}) -> atom().
+%% note: target_v_to_mod used by validator challenges related
+%% code flows. no need to support version below 5
+target_v_to_mod({error, not_found}) ->
+    blockchain_poc_target_v5;
+target_v_to_mod({ok, V}) when V =< 5 ->
+    blockchain_poc_target_v5;
+target_v_to_mod({ok, 6}) ->
+    blockchain_poc_target_v6.
 
 %% ------------------------------------------------------------------
 %% EUNIT Tests
@@ -706,13 +762,16 @@ pmap_test() ->
     ?assertEqual(Input, Results).
 
 get_pubkeybin_sigfun_test() ->
-    BaseDir = test_utils:tmp_dir("get_pubkeybin_sigfun_test"),
-    {ok, Swarm} = start_swarm(get_pubkeybin_sigfun_test, BaseDir),
-    {ok, PubKey, PayerSigFun, _} = libp2p_swarm:keys(Swarm),
-    PubKeyBin = libp2p_crypto:pubkey_to_bin(PubKey),
-    ?assertEqual({PubKeyBin, PayerSigFun}, get_pubkeybin_sigfun(Swarm)),
-    libp2p_swarm:stop(Swarm),
-    ok.
+    {timeout, 30000,
+     fun() ->
+         BaseDir = test_utils:tmp_dir("get_pubkeybin_sigfun_test"),
+         {ok, Swarm} = start_swarm(get_pubkeybin_sigfun_test, BaseDir),
+         {ok, PubKey, PayerSigFun, _} = libp2p_swarm:keys(Swarm),
+         PubKeyBin = libp2p_crypto:pubkey_to_bin(PubKey),
+         ?assertEqual({PubKeyBin, PayerSigFun}, get_pubkeybin_sigfun(Swarm)),
+         libp2p_swarm:stop(Swarm),
+         ok
+     end}.
 
 start_swarm(Name, BaseDir) ->
     SwarmOpts = [
@@ -723,21 +782,47 @@ start_swarm(Name, BaseDir) ->
     libp2p_swarm:start(Name, SwarmOpts).
 
 bitvector_roundtrip_test() ->
-    L1 = [begin B = case rand:uniform(2) of 1 -> true; _ -> false end, {N,B} end || N <- lists:seq(1, 16)],
-    L2 = [begin B = case rand:uniform(2) of 1 -> true; _ -> false end, {N,B} end || N <- lists:seq(1, 19)],
-    L3 = [begin B = case rand:uniform(2) of 1 -> true; _ -> false end, {N,B} end || N <- lists:seq(1, 64)],
-    L4 = [begin B = case rand:uniform(2) of 1 -> true; _ -> false end, {N,B} end || N <- lists:seq(1, 122)],
+    L01 = [begin B = case rand:uniform(3) of 1 -> true; 2 -> false; _ -> remove end, {N,B} end || N <- lists:seq(1, 16)],
+    L02 = [begin B = case rand:uniform(3) of 1 -> true; 2 -> false; _ -> remove end, {N,B} end || N <- lists:seq(1, 19)],
+    L03 = [begin B = case rand:uniform(3) of 1 -> true; 2 -> false; _ -> remove end, {N,B} end || N <- lists:seq(1, 64)],
+    L04 = [begin B = case rand:uniform(3) of 1 -> true; 2 -> false; _ -> remove end, {N,B} end || N <- lists:seq(1, 122)],
+
+    L1 = lists:filter(fun({_, remove}) -> false; (_) -> true end, L01),
+    L2 = lists:filter(fun({_, remove}) -> false; (_) -> true end, L02),
+    L3 = lists:filter(fun({_, remove}) -> false; (_) -> true end, L03),
+    L4 = lists:filter(fun({_, remove}) -> false; (_) -> true end, L04),
 
     M1 = maps:from_list(L1),
     M2 = maps:from_list(L2),
     M3 = maps:from_list(L3),
     M4 = maps:from_list(L4),
 
-    ?assertEqual(M1, bitvector_to_map(16, map_to_bitvector(M1))),
-    ?assertEqual(M2, bitvector_to_map(19, map_to_bitvector(M2))),
-    ?assertEqual(M3, bitvector_to_map(64, map_to_bitvector(M3))),
-    ?assertEqual(M4, bitvector_to_map(122, map_to_bitvector(M4))),
+    ?assert(compare(M1, bitvector_to_map(16, map_to_bitvector(M1)))),
+    ?assert(compare(M2, bitvector_to_map(19, map_to_bitvector(M2)))),
+    ?assert(compare(M3, bitvector_to_map(64, map_to_bitvector(M3)))),
+    ?assert(compare(M4, bitvector_to_map(122, map_to_bitvector(M4)))),
+
+    BV1 = map_to_bitvector(#{1 => true, 9 => true}),
+    ?assertEqual(2, byte_size(BV1)),
+    BV2 = map_to_bitvector(#{1 => true, 9 => true, 17 => true}),
+    ?assertEqual(3, byte_size(BV2)),
+    BV3 = map_to_bitvector(#{1 => true, 9 => true, 17 => true, 25 => true}),
+    ?assertEqual(4, byte_size(BV3)),
+
     ok.
+
+compare(M1, M2) ->
+    maps:fold(
+      fun(_, _, false) ->
+              false;
+         (K, V, true) ->
+              case maps:find(K, M2) of
+                  {ok, V} -> true;
+                  _ -> false
+              end
+      end,
+      true,
+      M1).
 
 oracle_keys_test() ->
     #{ public := RawEccPK } = libp2p_crypto:generate_keys(ecc_compact),

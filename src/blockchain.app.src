@@ -19,6 +19,7 @@
         h3,
         erl_angry_purple_tiger,
         erlang_stats,
+        telemetry,
         e2qc,
         vincenty,
         helium_proto,
@@ -28,7 +29,8 @@
         base64url,
         jsx,
         erbloom,
-        grpc_client
+        grpc_client,
+        hackney
     ]},
     {env,[]},
     {modules, []},

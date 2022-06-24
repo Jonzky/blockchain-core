@@ -90,12 +90,16 @@ snapshot_take(Filename) ->
     Chain = blockchain_worker:blockchain(),
     Ledger = blockchain:ledger(Chain),
     ok = blockchain_lock:acquire(),
-    Blocks = blockchain_ledger_snapshot_v1:get_blocks(Chain),
-    Infos = blockchain_ledger_snapshot_v1:get_infos(Chain),
-    {ok, Snapshot} = blockchain_ledger_snapshot_v1:snapshot(Ledger, Blocks, Infos),
-    blockchain_lock:release(),
-    BinSnap = blockchain_ledger_snapshot_v1:serialize(Snapshot),
-    file:write_file(Filename, BinSnap).
+    case blockchain_ledger_snapshot_v1:get_blocks(Chain) of
+        {error, encountered_a_rescue_block}=Err ->
+            Err;
+        {ok, Blocks} ->
+            Infos = blockchain_ledger_snapshot_v1:get_infos(Chain),
+            {ok, Snapshot} = blockchain_ledger_snapshot_v1:snapshot(Ledger, Blocks, Infos),
+            blockchain_lock:release(),
+            BinSnap = blockchain_ledger_snapshot_v1:serialize(Snapshot),
+            blockchain:save_compressed_bin_snapshot(Filename, BinSnap)
+    end.
 
 snapshot_load_cmd() ->
     [
@@ -135,7 +139,7 @@ snapshot_grab(["snapshot", "grab", HeightStr, HashStr, Filename], [], []) ->
         Hash = hex_to_binary(HashStr),
         {ok, Snapshot} = blockchain_worker:grab_snapshot(Height, Hash),
         %% NOTE: grab_snapshot returns a deserialized snapshot
-        file:write_file(Filename, blockchain_ledger_snapshot_v1:serialize(Snapshot))
+        blockchain:save_compressed_bin_snapshot(Filename, blockchain_ledger_snapshot_v1:serialize(Snapshot))
     catch
         _Type:Error ->
             [clique_status:text(io_lib:format("failed: ~p", [Error]))]
@@ -161,11 +165,10 @@ snapshot_diff(_, _, _) ->
     usage.
 
 snapshot_diff(AFilename, BFilename) ->
-    {ok, ABinSnap} = file:read_file(AFilename),
-    {ok, BBinSnap} = file:read_file(BFilename),
-
-    {ok, A} = blockchain_ledger_snapshot_v1:deserialize(ABinSnap),
-    {ok, B} = blockchain_ledger_snapshot_v1:deserialize(BBinSnap),
+    {ok, ABin} = file:read_file(AFilename),
+    {ok, BBin} = file:read_file(BFilename),
+    {ok, A} = blockchain_ledger_snapshot_v1:deserialize(ABin),
+    {ok, B} = blockchain_ledger_snapshot_v1:deserialize(BBin),
 
     blockchain_ledger_snapshot_v1:diff(A, B).
 
@@ -181,12 +184,8 @@ snapshot_info_usage() ->
     ].
 
 snapshot_info(["snapshot", "info", Filename], [], []) ->
-    {ok, BinSnap} = file:read_file(Filename),
-    {ok, Snap} = blockchain_ledger_snapshot_v1:deserialize(BinSnap),
-    BlocksContained = binary_to_term(maps:get(blocks, Snap)),
-    NumBlocks = length(BlocksContained),
-    StartBlockHt = blockchain_block:height(blockchain_block:deserialize(hd(BlocksContained))),
-    EndBlockHt = blockchain_block:height(blockchain_block:deserialize(lists:last(BlocksContained))),
+    {ok, Snap} = blockchain_ledger_snapshot_v1:deserialize({file, Filename}),
+    {ok, {NumBlocks, StartBlockHt, EndBlockHt}} = blockchain_ledger_snapshot_v1:blocks_info(Snap),
     [clique_status:text(io_lib:format("Height ~p\nNumBlocks ~p\nStartBlockHt ~p\nEndBlockHt ~p\nHash ~p (~p)\n",
                                       [blockchain_ledger_snapshot_v1:height(Snap),
                                        NumBlocks,

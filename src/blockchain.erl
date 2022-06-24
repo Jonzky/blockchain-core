@@ -60,12 +60,14 @@
 
     init_assumed_valid/2,
 
-    add_gateway_txn/2, add_gateway_txn/4,
+    add_gateway_txn/4,
     assert_loc_txn/4, assert_loc_txn/6,
 
     add_snapshot/2, add_bin_snapshot/4,
     have_snapshot/2, get_snapshot/2, find_last_snapshot/1,
     find_last_snapshots/2,
+    hash_bin_snapshot/1, size_bin_snapshot/1,
+    save_compressed_bin_snapshot/2, maybe_get_compressed_snapdata/1,
 
     add_implicit_burn/3,
     get_implicit_burn/2,
@@ -79,15 +81,16 @@
     db_handle/1,
     blocks_cf/1,
     heights_cf/1,
-    info_cf/1
+    info_cf/1,
 
+    bootstrap_hexes/1
 ]).
 
 -include("blockchain.hrl").
 -include("blockchain_vars.hrl").
 
 -ifdef(TEST).
--export([bootstrap_hexes/1, can_add_block/2, get_plausible_blocks/1, clean/1]).
+-export([can_add_block/2, get_plausible_blocks/1, clean/1]).
 %% export a macro so we can interpose block saving to test failure
 -define(save_block(Block, Chain), ?MODULE:save_block(Block, Chain)).
 -include_lib("eunit/include/eunit.hrl").
@@ -134,6 +137,8 @@
                           fun upgrade_gateways_score/1,
                           fun upgrade_nonce_rescue/1,
                           fun blockchain_ledger_v1:upgrade_pocs/1]).
+
+-define(BLOCK_READ_SIZE, 4096*8). % 32K
 
 -type blocks() :: #{blockchain_block:hash() => blockchain_block:block()}.
 -type blockchain() :: #blockchain{}.
@@ -261,7 +266,7 @@ upgrade_gateways_v2(Ledger) ->
                            Neighbors = blockchain_poc_path:neighbors(A, Gateways, Ledger),
                            blockchain_ledger_gateway_v2:neighbors(Neighbors, G)
                    end,
-              blockchain_ledger_v1:update_gateway(G1, A, Ledger)
+              blockchain_ledger_v1:update_gateway(G, G1, A, Ledger)
       end, Gateways),
     ok.
 
@@ -275,7 +280,7 @@ upgrade_gateways_lg(Ledger) ->
               case blockchain_ledger_gateway_v2:serialize(Gw) of
                   BinGw -> ok;
                   _ ->
-                      blockchain_ledger_v1:update_gateway(Gw, Addr, Ledger)
+                      blockchain_ledger_v1:update_gateway(new, Gw, Addr, Ledger)
               end
       end,
       whatever,
@@ -293,7 +298,7 @@ upgrade_gateways_score(Ledger) ->
                       case blockchain_ledger_gateway_v2:serialize(Gw1) of
                           BinGw -> ok;
                           _ ->
-                              blockchain_ledger_v1:update_gateway(Gw1, Addr, Ledger)
+                              blockchain_ledger_v1:update_gateway(Gw, Gw1, Addr, Ledger)
                       end
               end,
               whatever,
@@ -335,6 +340,7 @@ upgrade_nonce_rescue(Ledger) ->
 get_upgrades(Ledger) ->
     [ Key || Key <- ?BC_UPGRADE_NAMES, blockchain_ledger_v1:check_key(Key, Ledger) ].
 
+%% move this to ledger?
 bootstrap_hexes(Ledger) ->
     %% hardcode this until we have the var update hook.
     Res = 5,
@@ -365,7 +371,7 @@ upgrade_gateways_oui(Ledger) ->
     %% find all neighbors for everyone
     maps:map(
       fun(A, G) ->
-              blockchain_ledger_v1:update_gateway(G, A, Ledger)
+              blockchain_ledger_v1:update_gateway(new, G, A, Ledger)
       end, Gateways),
     ok.
 
@@ -381,7 +387,7 @@ clear_witnesses(Ledger) ->
               case blockchain_ledger_gateway_v2:serialize(Gw2) of
                   BinGw -> ok;
                   _ ->
-                      blockchain_ledger_v1:update_gateway(Gw2, Addr, Ledger)
+                      blockchain_ledger_v1:update_gateway(Gw, Gw2, Addr, Ledger)
               end
       end,
       whatever,
@@ -398,7 +404,7 @@ bootstrap_h3dex(Ledger) ->
 %%--------------------------------------------------------------------
 integrate_genesis(GenesisBlock, #blockchain{db=DB, default=DefaultCF}=Blockchain) ->
     GenHash = blockchain_block:hash_block(GenesisBlock),
-    ok = blockchain_txn:absorb_and_commit(GenesisBlock, Blockchain, fun(_, _) ->
+    {ok, _} = blockchain_txn:absorb_and_commit(GenesisBlock, Blockchain, fun(_, _) ->
         {ok, Batch} = rocksdb:batch(),
         ok = save_block(GenesisBlock, Batch, Blockchain),
         GenBin = blockchain_block:serialize(GenesisBlock),
@@ -641,10 +647,9 @@ fold_blocks(Chain0, DelayedHeight, DelayedLedger, Height, ForceRecalc) ->
               case ?MODULE:get_block(H, Chain0) of
                   {ok, Block} ->
                       case blockchain_txn:absorb_block(Block, ChainAcc) of
-                          {ok, Chain1} ->
+                          {ok, Chain1, _} ->
                               {ok, H} = blockchain_ledger_v1:current_height(blockchain:ledger(Chain1)),
-                              Hash = blockchain_block:hash_block(Block),
-                              ok = run_gc_hooks(ChainAcc, Hash),
+                              ok = run_gc_hooks(ChainAcc, Block),
 
                               case ForceRecalc of
                                   false ->
@@ -790,7 +795,6 @@ get_block_info(Height, Chain = #blockchain{db=DB, info=InfoCF}) ->
             Error
     end.
 
-
 -spec mk_block_info(blockchain_block:hash(), blockchain_block:block()) -> #block_info_v2{}.
 mk_block_info(Hash, Block) ->
     PoCs = lists:flatmap(
@@ -846,10 +850,11 @@ upgrade_block_info(#block_info{hash = Hash, height = Height}, Block, Chain = #bl
     deserialize_block_info(InfoBin, Chain).
 
 %% @doc read blocks from the db without deserializing them
--spec get_raw_block(blockchain_block:hash() | integer(), blockchain()) -> {ok, binary()} | not_found | {error, any()}.
-get_raw_block(Hash, #blockchain{db=DB, blocks=BlocksCF}) when is_binary(Hash) ->
+-spec get_raw_block(blockchain_block:hash() | integer(), blockchain()) ->
+    {ok, binary()} | not_found | {error, any()}.
+get_raw_block(<<Hash/binary>>, #blockchain{db=DB, blocks=BlocksCF}) ->
     rocksdb:get(DB, BlocksCF, Hash, []);
-get_raw_block(Height, #blockchain{db=DB, heights=HeightsCF}=Blockchain) ->
+get_raw_block(Height, #blockchain{db=DB, heights=HeightsCF}=Blockchain) when is_integer(Height) ->
     case rocksdb:get(DB, HeightsCF, <<Height:64/integer-unsigned-big>>, []) of
        {ok, Hash} ->
            ?MODULE:get_raw_block(Hash, Blockchain);
@@ -1126,10 +1131,10 @@ add_block_(Block, Blockchain, Syncing) ->
                     Hash = blockchain_block:hash_block(Block),
                     Sigs = blockchain_block:signatures(Block),
                     MyAddress = try blockchain_swarm:pubkey_bin() catch _:_ -> nomatch end,
-                    BeforeCommit = fun(FChain, FHash) ->
+                    BeforeCommit = fun(FChain, _FHash) ->
                                            lager:debug("adding block ~p", [Height]),
                                            ok = ?save_block(Block, Blockchain),
-                                           ok = run_gc_hooks(FChain, FHash)
+                                           ok = run_gc_hooks(FChain, Block)
                                    end,
                     {Signers, _Signatures} = lists:unzip(Sigs),
                     Fun = case lists:member(MyAddress, Signers) orelse FollowMode of
@@ -1148,6 +1153,7 @@ add_block_(Block, Blockchain, Syncing) ->
                                              Ledger, Height, Blockchain);
                         _ -> ok
                     end,
+
                     case blockchain_txn:Fun(Block, Blockchain, BeforeCommit, IsRescue) of
                         {error, Reason}=Error ->
                             lager:error("Error absorbing transaction, Ignoring Hash: ~p, Reason: ~p", [blockchain_block:hash_block(Block), Reason]),
@@ -1159,8 +1165,8 @@ add_block_(Block, Blockchain, Syncing) ->
                                     ok
                             end,
                             Error;
-                        ok ->
-                            run_absorb_block_hooks(Syncing, Hash, Blockchain)
+                        {ok, KeysPayload} ->
+                            run_absorb_block_hooks(Syncing, Hash, Blockchain, KeysPayload)
                     end;
                 plausible ->
                     %% regossip plausible blocks
@@ -1205,30 +1211,38 @@ process_snapshot(ConsensusHash, MyAddress, Signers,
                     {error, sentinel} ->
                         lager:info("skipping previously failed snapshot at height ~p", [Height]);
                     _ ->
-                        Blocks = blockchain_ledger_snapshot_v1:get_blocks(Blockchain),
-                        Infos = blockchain_ledger_snapshot_v1:get_infos(Blockchain),
-                        case blockchain_ledger_snapshot_v1:snapshot(Ledger, Blocks, Infos) of
-                            {ok, Snap} ->
-                                case blockchain_ledger_snapshot_v1:hash(Snap) of
-                                    ConsensusHash ->
-                                        {ok, _, ConsensusHash} = add_snapshot(Snap, ConsensusHash, Blockchain);
-                                    OtherHash ->
-                                        lager:info("bad snapshot hash: ~p good ~p",
-                                                   [OtherHash, ConsensusHash]),
-                                        case application:get_env(blockchain, save_bad_snapshot, false) of
-                                            true ->
-                                                lager:info("saving bad snapshot ~p", [OtherHash]),
-                                                {ok, _, OtherHash} = add_snapshot(Snap, OtherHash, Blockchain);
-                                            false ->
-                                                ok
-                                        end,
-                                        %% TODO: this is currently called basically for the
-                                        %% logging. it does not reset, or halt
-                                        blockchain_worker:async_reset(Height)
-                                end;
-                            {error, SnapReason} ->
-                                lager:info("error ~p taking snapshot", [SnapReason]),
-                                ok
+                        case blockchain_ledger_snapshot_v1:get_blocks(Blockchain) of
+                            {error, encountered_a_rescue_block} ->
+                                lager:warning(
+                                    "Aborting current snapshot creation attempt: "
+                                    "blocks contain a rescue block. "
+                                    "Will retry later."
+                                );
+                            {ok, Blocks} ->
+                                Infos = blockchain_ledger_snapshot_v1:get_infos(Blockchain),
+                                case blockchain_ledger_snapshot_v1:snapshot(Ledger, Blocks, Infos) of
+                                    {ok, Snap} ->
+                                        case blockchain_ledger_snapshot_v1:hash(Snap) of
+                                            ConsensusHash ->
+                                                {ok, _, ConsensusHash} = add_snapshot(Snap, ConsensusHash, Blockchain);
+                                            OtherHash ->
+                                                lager:info("bad snapshot hash: ~p good ~p",
+                                                           [OtherHash, ConsensusHash]),
+                                                case application:get_env(blockchain, save_bad_snapshot, false) of
+                                                    true ->
+                                                        lager:info("saving bad snapshot ~p", [OtherHash]),
+                                                        {ok, _, OtherHash} = add_snapshot(Snap, OtherHash, Blockchain);
+                                                    false ->
+                                                        ok
+                                                end,
+                                                %% TODO: this is currently called basically for the
+                                                %% logging. it does not reset, or halt
+                                                blockchain_worker:async_reset(Height)
+                                        end;
+                                    {error, SnapReason} ->
+                                        lager:info("error ~p taking snapshot", [SnapReason]),
+                                        ok
+                                end
                         end
                 end
             catch What:Why ->
@@ -1247,10 +1261,10 @@ replay_blocks(Chain, Syncing, LedgerHeight, ChainHeight) ->
                         _ -> absorb_and_commit
                     end,
               case blockchain_txn:Fun(B, Chain,
-                                      fun(FChain, FHash) -> ok = run_gc_hooks(FChain, FHash) end,
+                                      fun(FChain, _FHash) -> ok = run_gc_hooks(FChain, B) end,
                                       blockchain_block:is_rescue_block(B)) of
-                  ok ->
-                      run_absorb_block_hooks(Syncing, Hash, Chain);
+                  {ok, KeysPayload} ->
+                      run_absorb_block_hooks(Syncing, Hash, Chain, KeysPayload);
                   {error, Reason} ->
                       lager:error("Error absorbing transaction, "
                                   "Ignoring Hash: ~p, Reason: ~p",
@@ -1339,17 +1353,17 @@ absorb_temp_blocks_fun_([BlockHash|Chain], Blockchain, Syncing) ->
     {ok, Block} = get_temp_block(BlockHash, Blockchain),
     Height = blockchain_block:height(Block),
     Hash = blockchain_block:hash_block(Block),
-    BeforeCommit = fun(FChain, FHash) ->
+    BeforeCommit = fun(FChain, _FHash) ->
                            lager:info("adding block ~p", [Height]),
                            ok = ?save_block(Block, Blockchain),
-                           ok = run_gc_hooks(FChain, FHash)
+                           ok = run_gc_hooks(FChain, Block)
                    end,
     case blockchain_txn:unvalidated_absorb_and_commit(Block, Blockchain, BeforeCommit, blockchain_block:is_rescue_block(Block)) of
         {error, Reason}=Error ->
             lager:error("Error absorbing transaction, Ignoring Hash: ~p, Reason: ~p", [blockchain_block:hash_block(Block), Reason]),
             Error;
-        ok ->
-            run_absorb_block_hooks(Syncing, Hash, Blockchain),
+        {ok, KeysPayload} ->
+            run_absorb_block_hooks(Syncing, Hash, Blockchain, KeysPayload),
             absorb_temp_blocks_fun_(Chain, Blockchain, Syncing)
     end.
 
@@ -1594,20 +1608,20 @@ reset_ledger(Height,
                               {ok, BinBlock} = rocksdb:get(DB, BlocksCF, Hash, []),
                               Block = blockchain_block:deserialize(BinBlock),
                               lager:info("absorbing block ~p ?= ~p", [H, blockchain_block:height(Block)]),
-                              BeforeCommit = fun(FChain, FHash) ->
-                                                     ok = run_gc_hooks(FChain, FHash)
+                              BeforeCommit = fun(FChain, _FHash) ->
+                                                     ok = run_gc_hooks(FChain, Block)
                                              end,
                               case Revalidate of
                                   false ->
-                                      ok = blockchain_txn:unvalidated_absorb_and_commit(Block, CAcc, BeforeCommit,
+                                      {ok, KeysPayload} = blockchain_txn:unvalidated_absorb_and_commit(Block, CAcc, BeforeCommit,
                                                                                         blockchain_block:is_rescue_block(Block));
                                   true ->
-                                      ok = blockchain_txn:absorb_and_commit(Block, CAcc, BeforeCommit,
+                                      {ok, KeysPayload} = blockchain_txn:absorb_and_commit(Block, CAcc, BeforeCommit,
                                                                             blockchain_block:is_rescue_block(Block))
                               end,
                               Hash = blockchain_block:hash_block(Block),
                               %% can only get here if the absorb suceeded
-                              run_absorb_block_hooks(true, Hash, CAcc),
+                              run_absorb_block_hooks(true, Hash, CAcc, KeysPayload),
                               CAcc;
                           _ ->
                               lager:warning("couldn't absorb block at ~p", [H]),
@@ -1955,27 +1969,13 @@ add_bin_snapshot(_BinSnap, _Height, none, _Chain) -> {error, no_snapshot_hash};
 add_bin_snapshot(BinSnap, Height, Hash, #blockchain{db=DB, dir=Dir, snapshots=SnapshotsCF}) when is_binary(Hash) ->
     try
         SnapDir = filename:join(Dir, "saved-snaps"),
-        SnapFile = list_to_binary(io_lib:format("snap-~s", [blockchain_utils:bin_to_hex(Hash)])),
+        SnapFile = io_lib:format("snap-~s", [blockchain_utils:bin_to_hex(Hash)]),
         OhSnap = filename:join(SnapDir, SnapFile),
-        ok = filelib:ensure_dir(OhSnap),
-        case BinSnap of
-            {file, Filename} ->
-                case filelib:is_regular(OhSnap) of
-                    true ->
-                        ok = file:delete(OhSnap);
-                    false ->
-                        ok
-                end,
-                ok = file:make_link(Filename, OhSnap);
-            B when is_binary(B); is_list(B) ->
-                %% can be a binary or an iolist if it was generated locally
-                %% and we can avoid constructing a large binary by just dumping the
-                %% iolist to disk
-                ok = file:write_file(filename:join(SnapDir, SnapFile), BinSnap)
-        end,
+        {ok, CompressedSnapFile} = save_compressed_bin_snapshot(OhSnap, BinSnap),
         {ok, Batch} = rocksdb:batch(),
-        %% store the snap as a filename
-        ok = rocksdb:batch_put(Batch, SnapshotsCF, Hash, <<"file:", SnapFile/binary>>),
+        %% store the snap as a filename, which might be wrong if compressed
+        ok = rocksdb:batch_put(Batch, SnapshotsCF, Hash,
+                               <<"file:", (iolist_to_binary(CompressedSnapFile))/binary>>),
         %% lexiographic ordering works better with big endian
         ok = rocksdb:batch_put(Batch, SnapshotsCF, <<Height:64/integer-unsigned-big>>, Hash),
         ok = rocksdb:write_batch(DB, Batch, [])
@@ -1983,6 +1983,99 @@ add_bin_snapshot(BinSnap, Height, Hash, #blockchain{db=DB, dir=Dir, snapshots=Sn
             lager:warning("error adding snapshot: ~p:~p, ~p", [What, Why, Stack]),
             {error, Why}
     end.
+
+-spec save_compressed_bin_snapshot(file:filename_all(), blockchain_ledger_snapshot:snapshot()) ->
+   {ok, Filename} | {error, Error :: term()} when Filename :: file:filename_all().
+%% @doc This function saves a binary snapshot, compressing the image based on
+%% the zlib compression library.
+%%
+%% Snapshots will be saved to the destination with a ".gz" extension
+%% automatically appended.
+%%
+%% The return error tuple return value contains a list, the values of which may
+%% or may not themselves also be error tuples.
+%%
+%% This is the preferred function to store snapshots to disk.
+save_compressed_bin_snapshot(DestFilename, {file, Filename}) ->
+   ok = filelib:ensure_dir(DestFilename),
+   CompressedFile = DestFilename ++ ".gz",
+   Z = zlib:open(),
+   ok = zlib:deflateInit(Z, best_compression, deflated, 16 + 15, 8, default),
+   {ok, In} = file:open(Filename, [raw, read, binary, compressed]),
+   {ok, Out} = file:open(CompressedFile, [raw, write, binary]),
+   RetVal = case do_compress(In, Out, Z) of
+               ok -> {ok, CompressedFile};
+               {error, _E} = Err -> Err
+            end,
+   file:close(In),
+   file:close(Out),
+   zlib:close(Z),
+   RetVal;
+save_compressed_bin_snapshot(DestFilename, BinSnap) ->
+   ok = filelib:ensure_dir(DestFilename),
+   CompressedFile = DestFilename ++ ".gz",
+   Z = zlib:open(),
+   ok = zlib:deflateInit(Z, best_compression, deflated, 16 + 15, 8, default),
+   {ok, Out} = file:open(CompressedFile, [raw, write, binary]),
+   Fun = fun(eof) ->
+               CData = zlib:deflate(Z, <<>>, finish),
+               file:write(Out, CData),
+               zlib:deflateEnd(Z);
+            (Data) ->
+               CData = zlib:deflate(Z, Data),
+               file:write(Out, CData)
+         end,
+   RetVal = blockchain_utils:streaming_transform_iolist(BinSnap, Fun),
+   file:close(Out),
+   zlib:close(Z),
+   {RetVal, CompressedFile}.
+
+do_compress(In, Out, Z) ->
+   case file:read(In, ?BLOCK_READ_SIZE) of
+      eof ->
+         CData = zlib:deflate(Z, <<>>, finish),
+         file:write(Out, CData),
+         zlib:deflateEnd(Z),
+         ok;
+      {ok, Data} ->
+         CData = zlib:deflate(Z, Data),
+         file:write(Out, CData),
+         do_compress(In, Out, Z);
+      {error, Error} ->
+         lager:error("While compressing got ~p", [Error]),
+         zlib:deflate(Z, <<>>, finish),
+         zlib:deflateEnd(Z),
+         {error, Error}
+   end.
+
+
+-spec hash_bin_snapshot(blockchain_ledger_snapshot:snapshot()) -> {ok, binary()} | {error, term()}.
+hash_bin_snapshot({file, Filename}) ->
+    blockchain_utils:streaming_file_hash(Filename);
+hash_bin_snapshot(BinSnap) when is_binary(BinSnap); is_list(BinSnap) ->
+    {ok, crypto:hash(sha256, BinSnap)}.
+
+-spec size_bin_snapshot(blockchain_ledger_snapshot:snapshot()) -> non_neg_integer().
+size_bin_snapshot({file, Filename}) ->
+    filelib:file_size(Filename);
+size_bin_snapshot(BinSnap) when is_binary(BinSnap); is_list(BinSnap) ->
+    byte_size(BinSnap).
+
+-spec maybe_get_compressed_snapdata(file:filename_all()) -> undefined | {ok, Size :: pos_integer(), Hash :: binary()}.
+maybe_get_compressed_snapdata(File) ->
+   CompressedFile = File ++ ".gz",
+   case filelib:is_regular(CompressedFile) of
+      true ->
+         case file:read_file_info(CompressedFile, [{time, posix}]) of
+            {error, _Err} -> undefined;
+            {ok, FI} ->
+               case blockchain_utils:streaming_file_hash(CompressedFile) of
+                  {ok, Hash} -> {ok, FI#file_info.size, Hash};
+                  _Other -> undefined
+               end
+         end;
+      false -> undefined
+   end.
 
 rocksdb_gc(BytesToDrop, #blockchain{db=DB, heights=HeightsCF}=Blockchain) ->
     {ok, Height} = blockchain:height(Blockchain),
@@ -2014,13 +2107,24 @@ do_rocksdb_gc(Bytes, Itr, #blockchain{dir=Dir, db=DB, heights=HeightsCF, blocks=
                     %% check if the snap is on disk
                     SnapDir = filename:join(Dir, "saved-snaps"),
                     SnapPath = filename:join(SnapDir, SnapFile),
-                    case file:read_file_info(SnapPath) of
-                        {ok, #file_info{size=Size}} ->
-                            file:delete(SnapPath),
-                            Size;
-                        _ ->
-                            0
-                    end;
+                    CompSnapBytes =
+                        case file:read_file_info(SnapPath) of
+                            {ok, #file_info{size=Size}} ->
+                                file:delete(SnapPath),
+                                Size;
+                            _ -> 0
+                        end,
+                    %% uncompressed paths are no longer generated but check to see if an old
+                    %% one is still on disk and clean it up
+                    UncompressedPath = string:trim(SnapPath, trailing, ".gz"),
+                    UncompSnapBytes =
+                        case file:read_file_info(UncompressedPath) of
+                            {ok, #file_info{size=UncompSize}} ->
+                                file:delete(UncompressedPath),
+                                UncompSize;
+                            _ -> 0
+                        end,
+                    CompSnapBytes + UncompSnapBytes;
                 {ok, Snap} ->
                     %% snap was in rocksdb
                     byte_size(Snap);
@@ -2271,9 +2375,9 @@ load_genesis(Dir) ->
 %% the supplied staking fee will have been derived from the API ( which will have the chain vars )
 -spec add_gateway_txn(OwnerB58::string(),
                       PayerB58::string() | undefined,
-                      Fee::pos_integer(),
-                      StakingFee::non_neg_integer()) -> {ok, binary()}.
-add_gateway_txn(OwnerB58, PayerB58, Fee, StakingFee) ->
+                      Fee::pos_integer() | undefined,
+                      StakingFee::non_neg_integer() | undefined) -> {ok, binary()}.
+add_gateway_txn(OwnerB58, PayerB58, Fee0, StakingFee0) ->
     Owner = libp2p_crypto:b58_to_bin(OwnerB58),
     Payer = case PayerB58 of
                 undefined -> <<>>;
@@ -2283,35 +2387,21 @@ add_gateway_txn(OwnerB58, PayerB58, Fee, StakingFee) ->
     {ok, PubKey, SigFun, _ECDHFun} =  blockchain_swarm:keys(),
     PubKeyBin = libp2p_crypto:pubkey_to_bin(PubKey),
     Txn0 = blockchain_txn_add_gateway_v1:new(Owner, PubKeyBin, Payer),
-    Txn = blockchain_txn_add_gateway_v1:staking_fee(blockchain_txn_add_gateway_v1:fee(Txn0, Fee), StakingFee),
-    SignedTxn = blockchain_txn_add_gateway_v1:sign_request(Txn, SigFun),
-    {ok, blockchain_txn:serialize(SignedTxn)}.
-
-%% @doc Creates a signed add_gatewaytransaction with this blockchain's keys as
-%% the gateway, and the given owner and payer
-%%
-%% NOTE: This is an alternative add_gateway creation that calculates the fee and
-%% staking fee from the current live blockchain.
--spec add_gateway_txn(OwnerB58::string(),
-                      PayerB58::string() | undefined) -> {ok, binary()}.
-add_gateway_txn(OwnerB58, PayerB58) ->
-    Owner = libp2p_crypto:b58_to_bin(OwnerB58),
-    Payer = case PayerB58 of
-                undefined -> <<>>;
-                [] -> <<>>;
-                _ -> libp2p_crypto:b58_to_bin(PayerB58)
-            end,
-    Chain = blockchain_worker:blockchain(),
-    {ok, PubKey, SigFun, _ECDHFun} =  blockchain_swarm:keys(),
-    PubKeyBin = libp2p_crypto:pubkey_to_bin(PubKey),
-    Txn0 = blockchain_txn_add_gateway_v1:new(Owner, PubKeyBin, Payer),
-    StakingFee = blockchain_txn_add_gateway_v1:calculate_staking_fee(Txn0, Chain),
+    StakingFee = case StakingFee0 of
+        undefined ->
+            blockchain_txn_add_gateway_v1:calculate_staking_fee(Txn0, blockchain_worker:blockchain());
+        _ -> StakingFee0
+    end,
     Txn1 = blockchain_txn_add_gateway_v1:staking_fee(Txn0, StakingFee),
-    Fee = blockchain_txn_add_gateway_v1:calculate_fee(Txn1, Chain),
-    Txn = blockchain_txn_add_gateway_v1:fee(Txn1, Fee),
-    SignedTxn = blockchain_txn_add_gateway_v1:sign_request(Txn, SigFun),
+    Fee = case Fee0 of
+        undefined ->
+            blockchain_txn_add_gateway_v1:calculate_fee(Txn1, blockchain_worker:blockchain());
+        _ ->
+            Fee0
+    end,
+    Txn2 = blockchain_txn_add_gateway_v1:fee(Txn1, Fee),
+    SignedTxn = blockchain_txn_add_gateway_v1:sign_request(Txn2, SigFun),
     {ok, blockchain_txn:serialize(SignedTxn)}.
-
 
 %% @doc Creates a signed assert_location transaction using the keys of
 %% this blockchain as the gateway to be asserted for the given
@@ -2662,7 +2752,7 @@ resync_fun(ChainHeight, LedgerHeight, Blockchain) ->
         {error, _} when LedgerHeight == 0 ->
             %% reload the genesis block
             {ok, GenesisBlock} = blockchain:genesis_block(Blockchain),
-            ok = blockchain_txn:unvalidated_absorb_and_commit(GenesisBlock, Blockchain, fun(_, _) -> ok end, false),
+            {ok, _} = blockchain_txn:unvalidated_absorb_and_commit(GenesisBlock, Blockchain, fun(_, _) -> ok end, false),
             {ok, GenesisHash} = blockchain:genesis_hash(Blockchain),
             ok = blockchain_worker:notify({integrate_genesis_block, GenesisHash}),
             case blockchain_ledger_v1:new_snapshot(blockchain:ledger(Blockchain)) of
@@ -2703,17 +2793,17 @@ resync_fun(ChainHeight, LedgerHeight, Blockchain) ->
                     try
                         lists:foreach(fun(Hash) ->
                                               {ok, Block} = get_block(Hash, Blockchain),
-                                              BeforeCommit = fun(FChain, FHash) ->
-                                                                     ok = run_gc_hooks(FChain, FHash)
+                                              BeforeCommit = fun(FChain, _FHash) ->
+                                                                     ok = run_gc_hooks(FChain, Block)
                                                              end,
                                               lager:info("absorbing block ~p", [blockchain_block:height(Block)]),
                                               case application:get_env(blockchain, force_resync_validation, false) of
                                                   true ->
-                                                      ok = blockchain_txn:absorb_and_commit(Block, Blockchain, BeforeCommit, blockchain_block:is_rescue_block(Block));
+                                                      {ok, KeysPayload} = blockchain_txn:absorb_and_commit(Block, Blockchain, BeforeCommit, blockchain_block:is_rescue_block(Block));
                                                   false ->
-                                                      ok = blockchain_txn:unvalidated_absorb_and_commit(Block, Blockchain, BeforeCommit, blockchain_block:is_rescue_block(Block))
+                                                      {ok, KeysPayload} = blockchain_txn:unvalidated_absorb_and_commit(Block, Blockchain, BeforeCommit, blockchain_block:is_rescue_block(Block))
                                               end,
-                                              run_absorb_block_hooks(true, Hash, Blockchain)
+                                              run_absorb_block_hooks(true, Hash, Blockchain, KeysPayload)
                                       end, HashChain)
                     after
                         blockchain_lock:release()
@@ -2938,14 +3028,16 @@ get_plausible_blocks(Itr, {ok, _Key, BinBlock}, Acc) ->
              end,
     get_plausible_blocks(Itr, rocksdb:iterator_move(Itr, next), NewAcc).
 
-run_gc_hooks(Blockchain, _Hash) ->
+run_gc_hooks(Blockchain, _Block) ->
     Ledger = blockchain:ledger(Blockchain),
     try
         ok = blockchain_ledger_v1:maybe_gc_pocs(Blockchain, Ledger),
 
         ok = blockchain_ledger_v1:maybe_gc_scs(Blockchain, Ledger),
 
-        ok = blockchain_ledger_v1:maybe_recalc_price(Blockchain, Ledger) %,
+        ok = blockchain_ledger_v1:maybe_gc_h3dex(Ledger),
+
+        ok = blockchain_ledger_v1:maybe_recalc_price(Blockchain, Ledger)
 
         %% ok = blockchain_ledger_v1:refresh_gateway_witnesses(Hash, Ledger)
     catch What:Why:Stack ->
@@ -2953,13 +3045,19 @@ run_gc_hooks(Blockchain, _Hash) ->
             {error, gc_hooks_failed}
     end.
 
-run_absorb_block_hooks(Syncing, Hash, Blockchain) ->
+run_absorb_block_hooks(Syncing, Hash, Blockchain, KeysPayload) ->
     Ledger = blockchain:ledger(Blockchain),
     case blockchain_ledger_v1:new_snapshot(Ledger) of
         {error, Reason}=Error ->
             lager:error("Error creating snapshot, Reason: ~p", [Reason]),
             Error;
         {ok, NewLedger} ->
+            case KeysPayload of
+                none -> ok;
+                {BlockHeight, BlockHash, POCSubset} ->
+                    ok = blockchain_worker:notify({poc_keys, {BlockHeight, BlockHash,
+                                                              POCSubset, NewLedger}})
+            end,
             case application:get_env(blockchain, test_mode, false) of
                 false ->
                     ok = blockchain_worker:notify({add_block, Hash, Syncing, NewLedger});
@@ -3091,7 +3189,8 @@ blocks_test_() ->
                                                election_epoch => 1,
                                                epoch_start => 0,
                                                seen_votes => [],
-                                               bba_completion => <<>>
+                                               bba_completion => <<>>,
+                                               poc_keys => []
                                               }),
              Hash = blockchain_block:hash_block(Block),
              ok = add_block(Block, Chain),
@@ -3169,7 +3268,8 @@ get_block_test_() ->
                                                election_epoch => 1,
                                                epoch_start => 0,
                                                seen_votes => [],
-                                               bba_completion => <<>>
+                                               bba_completion => <<>>,
+                                               poc_keys => []
                                               }),
              Hash = blockchain_block:hash_block(Block),
              ok = add_block(Block, Chain),
@@ -3192,6 +3292,7 @@ get_block_test_() ->
      end
     }.
 
+-ifdef(FIXME).
 block_info_upgrade_test() ->
     %% boilerplate to get a chain
     #{secret := Priv, public := Pub} = libp2p_crypto:generate_keys(ecc_compact),
@@ -3213,7 +3314,9 @@ block_info_upgrade_test() ->
                                       election_epoch => 1,
                                       epoch_start => 0,
                                       seen_votes => [],
-                                      bba_completion => <<>>
+                                      bba_completion => <<>>,
+                                      poc_keys => []
+
                                       }),
     V1BlockInfo = #block_info{  height = 1,
                                 time = 1,
@@ -3227,6 +3330,7 @@ block_info_upgrade_test() ->
                                     election_info = {1, 0},
                                     penalties = {<<>>, []}},
     V2BlockInfo = upgrade_block_info(V1BlockInfo, Block, Chain),
-    ?assertMatch(V2BlockInfo, ExpV2BlockInfo).
+    ?assertMatch(ExpV2BlockInfo, V2BlockInfo).
+-endif.
 
 -endif.

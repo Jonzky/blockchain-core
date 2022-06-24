@@ -24,6 +24,7 @@
 
          height/1,
          hash/1,
+         blocks_info/1,
 
          diff/2
         ]).
@@ -129,6 +130,7 @@
     | upgrades
     | net_overage
     | hnt_burned
+    | validator_count
     .
 
 -type key_raw() ::
@@ -260,6 +262,7 @@ generate_snapshot_v5(Ledger0, Blocks, Infos, Mode) ->
     try
         Ledger = blockchain_ledger_v1:mode(Mode, Ledger0),
         {ok, CurrHeight} = blockchain_ledger_v1:current_height(Ledger),
+        {ok, ValidatorCount} = blockchain_ledger_v1:validator_count(Ledger),
         {ok, ConsensusMembers} = blockchain_ledger_v1:consensus_members(Ledger),
         {ok, ElectionHeight} = blockchain_ledger_v1:election_height(Ledger),
         {ok, ElectionEpoch} = blockchain_ledger_v1:election_epoch(Ledger),
@@ -276,6 +279,7 @@ generate_snapshot_v5(Ledger0, Blocks, Infos, Mode) ->
         Validators = blockchain_ledger_v1:snapshot_validators(Ledger),
         DelayedHNT = blockchain_ledger_v1:snapshot_delayed_hnt(Ledger),
         PoCs = blockchain_ledger_v1:snapshot_raw_pocs(Ledger),
+        PPoCs = blockchain_ledger_v1:snapshot_proposed_pocs(Ledger),
         Accounts = blockchain_ledger_v1:snapshot_raw_accounts(Ledger),
         DCAccounts = blockchain_ledger_v1:snapshot_raw_dc_accounts(Ledger),
         SecurityAccounts = blockchain_ledger_v1:snapshot_raw_security_accounts(Ledger),
@@ -317,6 +321,7 @@ generate_snapshot_v5(Ledger0, Blocks, Infos, Mode) ->
                 {validators       , Validators},
                 {delayed_hnt      , DelayedHNT},
                 {pocs             , PoCs},
+                {proposed_pocs    , PPoCs},
                 {accounts         , Accounts},
                 {dc_accounts      , DCAccounts},
                 {security_accounts, SecurityAccounts},
@@ -333,7 +338,8 @@ generate_snapshot_v5(Ledger0, Blocks, Infos, Mode) ->
                 {oracle_price_list, OraclePriceList},
                 {upgrades         , Upgrades},
                 {net_overage      , NetOverage},
-                {hnt_burned       , HntBurned}
+                {hnt_burned       , HntBurned},
+                {validator_count  , ValidatorCount}
              ],
         Snap = maps:from_list(Pairs),
         {ok, Snap}
@@ -380,10 +386,18 @@ serialize_v6(#{version := v6}=Snapshot0, BlocksOrNoBlocks) ->
             noblocks ->
                 EmptyListBin
         end,
+    Infos =
+        case BlocksOrNoBlocks of
+            blocks ->
+                maps:get(infos, Snapshot0, EmptyListBin);
+            noblocks ->
+                EmptyListBin
+        end,
 
     Snapshot1 = maps:put(blocks, Blocks, Snapshot0),
+    Snapshot2 = maps:put(infos, Infos, Snapshot1),
 
-    Pairs = lists:keysort(1, maps:to_list(Snapshot1)),
+    Pairs = lists:keysort(1, maps:to_list(Snapshot2)),
     frame(6, serialize_pairs(Pairs)).
 
 -spec serialize_v5(snapshot_v5(), noblocks) -> binary().
@@ -428,7 +442,7 @@ deserialize(BinOrFile) ->
     | {error, bad_snapshot_hash}
     | {error, bad_snapshot_binary}.
 deserialize(DigestOpt, {file, Filename}) ->
-    {ok, FD} = file:open(Filename, [raw, read, binary]),
+    {ok, FD} = file:open(Filename, [raw, read, binary, compressed]),
     {ok, <<Vsn:8/integer, Siz:32/little-unsigned-integer>>} = file:read(FD, 5),
     case Vsn of
         V when V < 6 ->
@@ -589,6 +603,8 @@ load_into_ledger(Snapshot, L0, Mode) ->
                       [{delayed_hnt, load_delayed_hnt} || maps:is_key(delayed_hnt, Snapshot)] ++
                       [{upgrades, blockchain, mark_upgrades} || maps:is_key(upgrades, Snapshot)] ++
                       [net_overage || maps:is_key(net_overage, Snapshot)] ++
+                      [{proposed_pocs, load_proposed_pocs} || maps:is_key(proposed_pocs, Snapshot)] ++
+                      [validator_count || maps:is_key(validator_count, Snapshot)] ++
                       [begin
                            ok = blockchain_ledger_v1:clear_hnt_burned(L),
                            {hnt_burned, add_hnt_burned}
@@ -598,12 +614,16 @@ load_into_ledger(Snapshot, L0, Mode) ->
     case blockchain_ledger_v1:check_key(<<"poc_upgrade">>, L) of
         true -> ok;
         _ ->
-            %% have to do this here, otherwise it'll break block loads
-            blockchain_ledger_v1:upgrade_pocs(L),
-            blockchain_ledger_v1:mark_key(<<"poc_upgrade">>, L)
+            case blockchain_ledger_v1:config(?poc_challenger_type, L) of
+                {ok, validator} ->
+                    ok;
+                {error, not_found} ->
+                    %% have to do this here, otherwise it'll break block loads
+                    blockchain_ledger_v1:upgrade_pocs(L),
+                    blockchain_ledger_v1:mark_key(<<"poc_upgrade">>, L)
+            end
     end,
     blockchain_ledger_v1:commit_context(L).
-
 
 load_into_ledger_([], _, _) ->
     ok;
@@ -674,8 +694,6 @@ load_blocks(Ledger0, Chain, Snapshot) ->
                 stream_from_list([])
         end,
 
-    true = erlang:is_function(BlockStream),
-
     print_memory(),
     {ok, Curr2} = blockchain_ledger_v1:current_height(Ledger0),
 
@@ -688,12 +706,7 @@ load_blocks(Ledger0, Chain, Snapshot) ->
                     {ok, <<B0/binary>>} -> B0;
                     <<B0/binary>> -> B0
                 end,
-              Block =
-              case Block0 of
-                  B when is_binary(B) ->
-                      blockchain_block:deserialize(B);
-                  B -> B
-              end,
+            Block = blockchain_block:deserialize(Block0),
 
               Ht = blockchain_block:height(Block),
               %% since hash and block are written at the same time, just getting the
@@ -716,8 +729,7 @@ load_blocks(Ledger0, Chain, Snapshot) ->
                       Ledger2 = blockchain_ledger_v1:new_context(Ledger0),
                       Chain1 = blockchain:ledger(Ledger2, Chain),
                       Rescue = blockchain_block:is_rescue_block(Block),
-                      {ok, _Chain} = blockchain_txn:absorb_block(Block, Rescue, Chain1),
-                      %% Hash = blockchain_block:hash_block(Block),
+                      {ok, _Chain, _} = blockchain_txn:absorb_block(Block, Rescue, Chain1),
                       ok = blockchain_ledger_v1:maybe_gc_pocs(Chain1, Ledger2),
                       ok = blockchain_ledger_v1:maybe_gc_scs(Chain1, Ledger2),
                       %% ok = blockchain_ledger_v1:refresh_gateway_witnesses(Hash, Ledger2),
@@ -732,6 +744,7 @@ load_blocks(Ledger0, Chain, Snapshot) ->
       end,
       BlockStream).
 
+-spec stream_iter(fun((A) -> ok), blockchain_term:stream(A)) -> ok.
 stream_iter(F, S0) ->
     case S0() of
         none ->
@@ -741,6 +754,7 @@ stream_iter(F, S0) ->
             stream_iter(F, S1)
     end.
 
+-spec stream_from_list([A]) -> blockchain_term:stream(A).
 stream_from_list([]) ->
     fun () -> none end;
 stream_from_list([X | Xs]) ->
@@ -762,7 +776,7 @@ get_infos(Chain) ->
      || N <- lists:seq(max(?min_height, LoadInfoStart), Height)].
 
 -spec get_blocks(blockchain:blockchain()) ->
-    [binary()].
+    {ok, [binary()]} | {error, encountered_a_rescue_block}.
 get_blocks(Chain) ->
     Ledger = blockchain:ledger(Chain),
     {ok, Height} = blockchain_ledger_v1:current_height(Ledger),
@@ -789,11 +803,23 @@ get_blocks(Chain) ->
     %% whichever is lower.
     LoadBlockStart = min(DHeight, ElectionHeight - GraceBlocks),
 
-    [begin
-         {ok, B} = blockchain:get_raw_block(N, Chain),
-         B
-     end
-     || N <- lists:seq(max(?min_height, LoadBlockStart), Height)].
+    BlockHeightRange = lists:seq(max(?min_height, LoadBlockStart), Height),
+    Error = encountered_a_rescue_block,
+    try
+        FetchBlockAtHeight =
+            fun (H) ->
+                {ok, <<BlockRaw/binary>>} = blockchain:get_raw_block(H, Chain),
+                Block = blockchain_block:deserialize(BlockRaw),
+                case blockchain_block:is_rescue_block(Block) of
+                    true -> throw(Error);
+                    false -> BlockRaw
+                end
+            end,
+        Blocks = lists:map(FetchBlockAtHeight, BlockHeightRange),
+        {ok, Blocks}
+    catch throw:Error ->
+        {error, Error}
+    end.
 
 is_v6(#{version := v6}) -> true;
 is_v6(_) -> false.
@@ -820,10 +846,14 @@ hash(Snap) ->
         v6 ->
             %% attempt to incrementally hash the snapshot without building up a big binary
             Ctx0 = crypto:hash_init(sha256),
-            Size = snapshot_size(Snap#{blocks => <<>>}),
+            Size = snapshot_size(Snap#{blocks => <<>>, infos => <<>>}),
             Ctx1 = crypto:hash_update(Ctx0, <<6, Size:32/integer-unsigned-little>>),
             FinalCtx = lists:foldl(fun({blocks, _}, Acc) ->
                               Key = term_to_binary(blocks),
+                              KeyLen = byte_size(Key),
+                              crypto:hash_update(Acc, <<KeyLen:32/integer-unsigned-little, Key/binary, 0:32/integer-unsigned-little>>);
+                          ({infos, _}, Acc) ->
+                              Key = term_to_binary(infos),
                               KeyLen = byte_size(Key),
                               crypto:hash_update(Acc, <<KeyLen:32/integer-unsigned-little, Key/binary, 0:32/integer-unsigned-little>>);
                           ({version, Version}, Acc) ->
@@ -847,7 +877,7 @@ hash(Snap) ->
                               hash_bytes(TmpCtx, FD, Len)
                       end, Ctx1, lists:keysort(1, maps:to_list(Snap))),
             crypto:hash_final(FinalCtx);
-        _ -> 
+        _ ->
             crypto:hash(sha256, serialize(Snap, noblocks))
     end.
 
@@ -1236,6 +1266,21 @@ kv_stream_to_list(Next0) when is_function(Next0) ->
         ok -> [];
         {K, V, Next1} -> [{K, V} | kv_stream_to_list(Next1)]
     end.
+
+-spec blocks_info(snapshot()) -> {ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}}.
+blocks_info(Snap) ->
+    BlocksContained = case maps:get(blocks, Snap) of 
+                          BinData = <<131, _/binary>> -> 
+                              binary_to_term(BinData);
+                          {FD, Offset, Size} ->
+                              file:position(FD, Offset),
+                              {ok, BinData} = file:read(FD, Size),
+                              binary_to_term(BinData)
+                      end,
+    NumBlocks = length(BlocksContained),
+    StartBlockHt = blockchain_block:height(blockchain_block:deserialize(hd(BlocksContained))),
+    EndBlockHt = blockchain_block:height(blockchain_block:deserialize(lists:last(BlocksContained))),
+    {ok, {NumBlocks, StartBlockHt, EndBlockHt}}.
 
 diff(#{}=A0, #{}=B0) ->
     A = maps:from_list(

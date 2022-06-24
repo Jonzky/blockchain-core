@@ -135,8 +135,51 @@
 %% Number of blocks to wait before a hotspot can submit a poc challenge request
 -define(poc_challenge_interval, poc_challenge_interval).
 
+%% Number of challenges per block: integer
+-define(poc_challenge_rate, poc_challenge_rate).
+
+%% Actor type of the challenger: not set or 'validator'
+-define(poc_challenger_type, poc_challenger_type).
+
+%% scale the number of validators in the heartbeat proposals to ensure there are enough keys waiting
+-define(poc_validator_ct_scale, poc_validator_ct_scale).
+
 %% Allow to switch POC version
 -define(poc_version, poc_version).
+
+%% Number of blocks after a POC is started at which point it will timeout/expire: integer
+-define(poc_timeout, poc_timeout).
+
+%% Number of blocks after poc_timeout at which point the poc public data will be deleted from the ledger: integer
+%% NOTE: the public poc data is required as part of the receipt_v2 txn validations
+%%       and so this value must be sufficient as to give time for absorb to occur
+-define(poc_receipts_absorb_timeout, poc_receipts_absorb_timeout).
+
+%% Number of blocks for which a validator ephemeral key will remain valid : pos_integer
+%% after this period it will be GCed
+%% NOTE the minimum value here should be greater than that of validator_liveness_interval
+-define(poc_validator_ephemeral_key_timeout, poc_validator_ephemeral_key_timeout).
+
+%% determines whether or not to reject a v2 receipts txn which has no receipt : boolean
+-define(poc_reject_empty_receipts, poc_reject_empty_receipts).
+
+%% determines whether or not to use the fix for a buggy POC GC : boolean
+-define(poc_apply_gc_fix, poc_apply_gc_fix).
+%% determines whether or not to check if poc proposals are within a GC window
+%% before deciding whether to promote
+-define(poc_proposal_gc_window_check, poc_proposal_gc_window_check).
+
+%% Determines whether or not to filter out inactive gateways
+%% from POC targets :: boolean()
+-define(poc_activity_filter_enabled, poc_activity_filter_enabled).
+
+%% enables or disables processing gateway reactivations regardless of
+%% consensus status (GH#1357)
+-define(poc_always_process_reactivations, poc_always_process_reactivations).
+
+%% Whether or not to always use hip17 interactivity blocks
+%% when determining if a GW is active or inactive: boolean
+-define(harmonize_activity_on_hip17_interactivity_blocks, harmonize_activity_on_hip17_interactivity_blocks).
 
 %% Number of blocks to wait before a hotspot can be eligible to participate in a poc
 %% challenge. This would avoid new hotspots getting challenged before they sync to an
@@ -166,6 +209,26 @@
 
 %% resolution for h3 polyfills, defaulted to 7 before we set it
 -define(polyfill_resolution, polyfill_resolution).
+
+%% determines which hexing type to use for gateways: hex_h3dex | h3dex or not set
+%% hex_h3dex will result in both hexes and h3dex being updated
+%% h3dex will result in only h3dex being updated
+%% not set will result in both hexes and h3dex being updated
+-define(poc_hexing_type, poc_hexing_type).
+
+%% max number of hexes to GC in the h3dex per block: integer
+-define(h3dex_gc_width, h3dex_gc_width).
+
+%% the version number of poc targeting in use: integer
+%% if not set, code paths with default to 3 ( blockchain_poc_target_v3 )
+-define(poc_targeting_version, poc_targeting_version).
+
+%% the number of random hexes to utilize when targeting: integer
+-define(poc_target_pool_size, poc_target_pool_size).
+
+%% whether or not to process validation of poc receipt witnesses
+-define(poc_receipt_witness_validation, poc_receipt_witness_validation).
+
 %%%
 %%% score vars
 %%%
@@ -266,6 +329,9 @@
 %% Hierarchical targeting variables
 %% Create hexes at this resolution for all the hotspots on the network.
 -define(poc_target_hex_parent_res, poc_target_hex_parent_res).
+%% Defines the resolution at which the garbage collection is run, allowing us 
+%% to tune the per-block workload
+-define(poc_target_hex_collection_res, poc_target_hex_collection_res).
 
 %% RSSI Bucketing variables
 %% Weight associated with biasing for RSSI centrality measures
@@ -294,6 +360,9 @@
 
 %% Set this var to false to disable zero amount txns (payment_v1, payment_v2, htlc_create)
 -define(allow_zero_amount, allow_zero_amount).
+
+%% Set this var to `true' to enable balance clearing txns
+-define(enable_balance_clearing, enable_balance_clearing). % boolean
 
 %% General txn vars
 
@@ -341,7 +410,13 @@
 %% The "new" behavior (i.e., `true') is to count state channels
 %% that are only in the open state and ignore closed channels.
 -define(sc_only_count_open_active, sc_only_count_open_active).
+%% How to handle rewards when a state channel close is disputed.
+%%  - 0 :: reconcile as much as possible
+%%  - 1 :: accept first dispute, drop all DC from opener, no rewards
+-define(sc_dispute_strategy_version, sc_dispute_strategy_version).
 
+%% Txn Routing Xor Filter Fee calculation var HIP-XXX
+-define(txn_routing_update_xor_fees_version, txn_routing_update_xor_fees_version).
 
 %% ------------------------------------------------------------------
 %% snapshot vars
@@ -481,6 +556,7 @@
 -define(validator_minimum_stake, validator_minimum_stake).  % bones
 -define(validator_liveness_interval, validator_liveness_interval).  % blocks
 -define(validator_liveness_grace_period, validator_liveness_grace_period).  % blocks
+-define(validator_hb_reactivation_limit, validator_hb_reactivation_limit). % addresses
 -define(validator_penalty_filter, validator_penalty_filter). % float
 -define(validator_key_check, validator_key_check). % boolean
 -define(stake_withdrawal_cooldown, stake_withdrawal_cooldown). % blocks
@@ -505,7 +581,7 @@
 %% regulatory_region related variables
 
 %% This is a comma separated string like so:
-%% <<"region_as923_1,region_as923_2,region_as923_3,region_as923_4,region_au915,region_cn470,region_eu433,region_eu868,region_in865,region_kr920,region_ru864,region_us915">>
+%% <<"region_as923_1,region_as923_1b,region_as923_2,region_as923_3,region_as923_4,region_au915,region_cn470,region_eu433,region_eu868,region_in865,region_kr920,region_ru864,region_us915">>
 -define(regulatory_regions, regulatory_regions).
 
 %% Each of the former regions is associated with a dynamic var of the same name which is is a serialized form of an h3_region set determined at h3_res: 7

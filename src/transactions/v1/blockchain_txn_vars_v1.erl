@@ -40,7 +40,9 @@
          sign/2,
          print/1,
          json_type/0,
-         to_json/2
+         to_json/2,
+         process_hooks/3,
+         var_hook/3, unset_hook/2
         ]).
 
 %% helper API
@@ -597,6 +599,7 @@ delayed_absorb(Txn, Ledger) ->
     Vars = decode_vars(vars(Txn)),
     Unsets = decode_unsets(unsets(Txn)),
     ok = blockchain_ledger_v1:vars(Vars, Unsets, Ledger),
+    ok = process_hooks(Vars, Unsets, Ledger),
     case blockchain:config(?use_multi_keys, Ledger) of
         {ok, true} ->
             case multi_keys(Txn) of
@@ -612,7 +615,18 @@ delayed_absorb(Txn, Ledger) ->
                 Key ->
                     ok = blockchain_ledger_v1:master_key(Key, Ledger)
             end
-    end.
+    end,
+    case blockchain_ledger_v1:mode(Ledger) of
+        active ->
+            %% we've invalidated the region cache, so prewarm it.
+            spawn(fun() ->
+                          timer:sleep(30000),
+                          blockchain_region_v1:prewarm_cache(Ledger)
+                  end);
+        _ ->
+            ok
+    end,
+    ok.
 
 sum_higher(Target, Proplist) ->
     sum_higher(Target, Proplist, 0).
@@ -668,6 +682,97 @@ to_json(Txn, _Opts) ->
       unsets => unsets(Txn),
       nonce => nonce(Txn)
      }.
+
+-spec process_hooks(Vars :: map(), Unsets :: list(), Ledger :: blockchain_ledger_v1:ledger()) -> ok.
+process_hooks(Vars, Unsets, Ledger) ->
+    _ = maps:map(
+          fun(Var, Value) ->
+                  ?MODULE:var_hook(Var, Value, Ledger)
+          end, Vars),
+    _ = lists:foreach(
+          fun(Var) ->
+                  ?MODULE:unset_hook(Var, Ledger)
+          end, Unsets),
+    ok.
+
+%% Separate out hook functions and call them in separate functions below the hook section.
+
+-spec var_hook(Var :: atom(), Value :: any(), Ledger :: blockchain_ledger_v1:ledger()) -> ok.
+var_hook(?poc_targeting_version, 6, Ledger) ->
+    %% purge any active POCs
+    purge_pocs(Ledger),
+    %% build the h3dex lookup
+    {ok, Res} = blockchain_ledger_v1:config(?poc_target_hex_parent_res, Ledger),
+    blockchain_ledger_v1:build_random_hex_targeting_lookup(Res, Ledger),
+    ok;
+var_hook(?poc_targeting_version, 5, Ledger) ->
+    %% purge any active POCs
+    purge_pocs(Ledger),
+    %% v3 targeting enabled, remove the h3dex lookup
+    blockchain_ledger_v1:clean_random_hex_targeting_lookup(Ledger),
+    ok;
+var_hook(?poc_targeting_version, 4, Ledger) ->
+    %% v4 targeting enabled, build the h3dex lookup
+    {ok, Res} = blockchain_ledger_v1:config(?poc_target_hex_parent_res, Ledger),
+    blockchain_ledger_v1:build_random_hex_targeting_lookup(Res, Ledger),
+    ok;
+var_hook(?poc_targeting_version, 3, Ledger) ->
+    %% v3 targeting enabled, remove the h3dex lookup
+    blockchain_ledger_v1:clean_random_hex_targeting_lookup(Ledger),
+    ok;
+var_hook(?poc_target_hex_parent_res, Value, Ledger) ->
+    %% targeting resolution changed, rebuild h3dex lookup
+    blockchain_ledger_v1:clean_random_hex_targeting_lookup(Ledger),
+    blockchain_ledger_v1:build_random_hex_targeting_lookup(Value, Ledger),
+    ok;
+var_hook(?poc_hexing_type, h3dex, Ledger) ->
+    %% the hexes keys should be safe to remove now
+    blockchain_ledger_v1:clean_all_hexes(Ledger),
+    ok;
+var_hook(?poc_hexing_type, hex_h3dex, Ledger) ->
+    %% rebuild hexes since we're back to updating them
+    blockchain:bootstrap_hexes(Ledger),
+    ok;
+%% poc challenger type has been modified
+%% we want to clear out the pocs CF
+%% we dont care about its value, if its been
+%% updated then we wipe all POCs
+var_hook(?poc_challenger_type, Type, Ledger) ->
+    case Type of
+        validator ->
+            Ct =
+                blockchain_ledger_v1:fold_validators(
+                  fun(Val, Acc) ->
+                          case blockchain_ledger_validator_v1:status(Val) of
+                              staked ->
+                                  Acc + 1;
+                              _ -> Acc
+                          end
+                  end,
+                  0,
+                  Ledger),
+            blockchain_ledger_v1:validator_count(Ct, Ledger);
+        _ -> ok
+    end,
+    purge_pocs(Ledger),
+    ok;
+var_hook(_Var, _Value, _Ledger) ->
+    ok.
+
+-spec unset_hook(Var :: atom(), Ledger :: blockchain_ledger_v1:ledger()) -> ok.
+unset_hook(?poc_targeting_version, Ledger) ->
+    %% going back to the default, which is v3 so remove the h3dex lookup
+    blockchain_ledger_v1:clean_random_hex_targeting_lookup(Ledger),
+    ok;
+unset_hook(?poc_hexing_type, Ledger) ->
+    %% rebuild hexes since we're back to updating them
+    blockchain:bootstrap_hexes(Ledger),
+    ok;
+unset_hook(?poc_challenger_type, Ledger) ->
+    purge_pocs(Ledger),
+    ok;
+unset_hook(_Var, _Ledger) ->
+    ok.
 
 %%%
 %%% Helper API
@@ -895,6 +1000,22 @@ validate_var(?min_assert_h3_res, Value) ->
     validate_int(Value, "min_assert_h3_res", 0, 15, false);
 validate_var(?poc_challenge_interval, Value) ->
     validate_int(Value, "poc_challenge_interval", 10, 1440, false);
+validate_var(?poc_challenge_rate, Value) ->
+    validate_int(Value, "poc_challenge_rate", 1, 10000, false);
+validate_var(?poc_timeout, Value) ->
+    validate_int(Value, "poc_timeout", 1, 50, false);
+validate_var(?poc_receipts_absorb_timeout, Value) ->
+    validate_int(Value, "poc_receipts_absorb_timeout", 10, 100, false);
+validate_var(?poc_validator_ephemeral_key_timeout, Value) ->
+    validate_int(Value, "poc_validator_ephemeral_key_timeout", 1, 1000, false);
+
+validate_var(?poc_challenger_type, Value) ->
+    case Value of
+        validator ->
+            ok;
+        _ ->
+            throw({error, {poc_challenger_type, Value}})
+    end;
 validate_var(?poc_version, Value) ->
     case Value of
         N when is_integer(N), N >= 1,  N =< 11 ->
@@ -902,6 +1023,43 @@ validate_var(?poc_version, Value) ->
         _ ->
             throw({error, {invalid_poc_version, Value}})
     end;
+validate_var(?poc_activity_filter_enabled, Value) ->
+    case Value of
+        true -> ok;
+        false -> ok;
+        _ -> throw({error, {poc_activity_filter_enabled, Value}})
+    end;
+validate_var(?poc_always_process_reactivations, Value) ->
+    case Value of
+        true -> ok;
+        false -> ok;
+        _ -> throw({error, {poc_always_process_reactivations, Value}})
+    end;
+validate_var(?poc_reject_empty_receipts, Value) ->
+    case Value of
+        true -> ok;
+        false -> ok;
+        _ -> throw({error, {poc_reject_empty_receipts, Value}})
+    end;
+validate_var(?poc_apply_gc_fix, Value) ->
+    case Value of
+        true -> ok;
+        false -> ok;
+        _ -> throw({error, {poc_apply_gc_fix, Value}})
+    end;
+validate_var(?poc_proposal_gc_window_check, Value) ->
+    case Value of
+        true -> ok;
+        false -> ok;
+        _ -> throw({error, {poc_proposal_gc_window_check, Value}})
+    end;
+validate_var(?harmonize_activity_on_hip17_interactivity_blocks, Value) ->
+    case Value of
+        true -> ok;
+        false -> ok;
+        _ -> throw({error, {harmonize_activity_on_hip17_interactivity_blocks, Value}})
+    end;
+
 validate_var(?poc_challenge_sync_interval, Value) ->
     validate_int(Value, "poc_challenge_sync_interval", 10, 1440, false);
 validate_var(?poc_path_limit, undefined) ->
@@ -942,12 +1100,13 @@ validate_var(?poc_v5_target_prob_randomness_wt, Value) ->
     validate_float(Value, "poc_v5_target_prob_randomness_wt", 0.0, 1.0);
 validate_var(?poc_typo_fixes, Value) ->
     case Value of
-        true -> ok;
-        false -> ok;
+        Val when is_boolean(Val) -> ok;
         _ -> throw({error, {invalid_poc_typo_fixes, Value}})
     end;
 validate_var(?poc_target_hex_parent_res, Value) ->
     validate_int(Value, "poc_target_hex_parent_res", 3, 7, false);
+validate_var(?poc_target_hex_collection_res, Value) ->
+    validate_int(Value, "poc_target_hex_collection_res", 7, 12, false);
 validate_var(?poc_good_bucket_low, Value) ->
     validate_int(Value, "poc_good_bucket_low", -150, -90, false);
 validate_var(?poc_good_bucket_high, Value) ->
@@ -966,12 +1125,36 @@ validate_var(?poc_distance_limit, Value) ->
     validate_int(Value, "poc_distance_limit", 0, 1000, false);
 validate_var(?check_snr, Value) ->
     case Value of
-        true -> ok;
-        false -> ok;
+        Val when is_boolean(Val) -> ok;
         _ -> throw({error, {invalid_check_snr, Value}})
     end;
 validate_var(?polyfill_resolution, Value) ->
     validate_int(Value, "polyfill_resolution", 0, 15, false);
+validate_var(?h3dex_gc_width, Value) ->
+  validate_int(Value, "h3dex_gc_width", 1, 10000, false);
+validate_var(?poc_target_pool_size, Value) ->
+  validate_int(Value, "poc_target_pool_size", 1, 1000000, false);
+validate_var(?poc_targeting_version, Value) ->
+    case Value of
+        3 -> ok;
+        4 -> ok;
+        5 -> ok;
+        6 -> ok;
+        _ ->
+            throw({error, {invalid_poc_targeting_version, Value}})
+    end;
+validate_var(?poc_hexing_type, Value) ->
+  case Value of
+    hex_h3dex -> ok;
+    h3dex -> ok;
+    hex -> ok;
+    _ ->
+      throw({error, {poc_hexing_type, Value}})
+  end;
+validate_var(?poc_validator_ct_scale, Value) ->
+    validate_float(Value, "poc_validator_ct_scale", 0.1, 1.0);
+validate_var(?poc_receipt_witness_validation, Value) when is_boolean(Value) -> ok;
+validate_var(?poc_receipt_witness_validation, Value) -> throw({error, poc_receipt_witness_validation, Value});
 
 %% score vars
 validate_var(?alpha_decay, Value) ->
@@ -1031,23 +1214,26 @@ validate_var(?max_payments, Value) ->
 
 validate_var(?deprecate_payment_v1, Value) ->
     case Value of
-        true -> ok;
-        false -> ok;
-        _ -> throw({error, {invalid_deprecate_payment_v1, Value}})
+        Val when is_boolean(Val) -> ok;
+        _ -> throw({error, {invalidate_deprecate_payment_v1, Value}})
     end;
 
 validate_var(?allow_payment_v2_memos, Value) ->
     case Value of
-        true -> ok;
-        false -> ok;
+        Val when is_boolean(Val) -> ok;
         _ -> throw({error, {invalid_allow_payment_v2_memos, Value}})
     end;
 
 validate_var(?allow_zero_amount, Value) ->
     case Value of
-        true -> ok;
-        false -> ok;
+        Val when is_boolean(Val) -> ok;
         _ -> throw({error, {invalid_allow_zero_amount, Value}})
+    end;
+
+validate_var(?enable_balance_clearing, Value) ->
+    case Value of
+        Val when is_boolean(Val) -> ok;
+        _ -> throw({error, {invalid_enable_balance_clearing, Value}})
     end;
 
 %% general txn vars
@@ -1091,9 +1277,19 @@ validate_var(?sc_max_actors, Value) ->
     validate_int(Value, "sc_max_actors", 500, 10000, false);
 validate_var(?sc_only_count_open_active, Value) ->
     case Value of
-        true -> ok;
-        false -> ok;
-        Other -> throw({error, {invalid_sc_only_count_open_active_value, Other}})
+        Val when is_boolean(Val) -> ok;
+        _ -> throw({error, {invalid_sc_only_count_open_active_value, Value}})
+    end;
+validate_var(?sc_dispute_strategy_version, Value) ->
+    validate_int(Value, "sc_dispute_strategy_version", 0, 1, false);
+
+%% Txn Routing Xor Filter Fee calculation var HIP-XXX
+validate_var(?txn_routing_update_xor_fees_version, Value) ->
+    case Value of
+        N when is_integer(N), N == 1 ->
+            ok;
+        _ ->
+            throw({error, {invalid_txn_routing_update_xor_fees_version, Value}})
     end;
 
 %% txn snapshot vars
@@ -1136,8 +1332,7 @@ validate_var(?price_oracle_height_delta, Value) ->
 %% txn fee related vars
 validate_var(?txn_fees, Value) ->
     case Value of
-        true -> ok;
-        false -> ok;
+        Val when is_boolean(Val) -> ok;
         _ -> throw({error, {invalid_txn_fees, Value}})
     end;
 
@@ -1191,8 +1386,7 @@ validate_var(?data_aggregation_version, Value) ->
 
 validate_var(?use_multi_keys, Value) ->
     case Value of
-        true -> ok;
-        false -> ok;
+        Val when is_boolean(Val) -> ok;
         _ -> throw({error, {invalid_multi_keys, Value}})
     end;
 
@@ -1282,11 +1476,12 @@ validate_var(?validator_liveness_interval, Value) ->
     validate_int(Value, "validator_liveness_interval", 5, 2000, false);
 validate_var(?validator_liveness_grace_period, Value) ->
     validate_int(Value, "validator_liveness_grace_period", 1, 200, false);
+validate_var(?validator_hb_reactivation_limit, Value) ->
+    validate_int(Value, "validator_hb_reactivation_limit", 5, 100, false);
 validate_var(?validator_key_check, Value) ->
     case Value of
-        true -> ok;
-        false -> ok;
-        _ -> throw({error, {invalid_validator_key_check, Value}})
+        Val when is_boolean(Val) -> ok;
+        _ -> throw({error, {invalidate_validator_key_check, Value}})
     end;
 %% TODO fix this var
 validate_var(?stake_withdrawal_cooldown, Value) ->
@@ -1308,8 +1503,7 @@ validate_var(?penalty_history_limit, Value) ->
 
 validate_var(?net_emissions_enabled, Value) ->
     case Value of
-        true -> ok;
-        false -> ok;
+        Val when is_boolean(Val) -> ok;
         _ -> throw({error, {invalid_net_emissions_boolean, Value}})
     end;
 validate_var(?net_emissions_max_rate, Value) ->
@@ -1317,7 +1511,7 @@ validate_var(?net_emissions_max_rate, Value) ->
 
 validate_var(?regulatory_regions, Value) when is_binary(Value) ->
     %% The regulatory_regions value we support must look like this:
-    %% <<"region_as923_1,region_as923_2,region_as923_3,region_as923_4,region_au915,region_cn470,region_eu433,region_eu868,region_in865,region_kr920,region_ru864,region_us915">>
+    %% <<"region_as923_1,region_as923_1b,region_as923_2,region_as923_3,region_as923_4,region_au915,region_cn470,region_eu433,region_eu868,region_in865,region_kr920,region_ru864,region_us915">>
     %% The order does not matter in validation
 
     %% We only check that the binary string is comma separated
@@ -1331,8 +1525,7 @@ validate_var(?regulatory_regions, Value) ->
     throw({error, {invalid_regulatory_regions_not_binary, Value}});
 validate_var(?discard_zero_freq_witness, Value) ->
     case Value of
-        true -> ok;
-        false -> ok;
+        Val when is_boolean(Val) -> ok;
         _ -> throw({error, {invalid_discard_zero_freq_witness, Value}})
     end;
 validate_var(?block_size_limit, Value) ->
@@ -1454,6 +1647,8 @@ validate_region_params(Var, Value) when is_binary(Value) ->
 validate_region_params(Var, Value) ->
     throw({error, {invalid_region_param_not_binary, Var, Value}}).
 
+purge_pocs(Ledger) ->
+    blockchain_ledger_v1:purge_pocs(Ledger).
 
 %% ------------------------------------------------------------------
 %% EUNIT Tests
