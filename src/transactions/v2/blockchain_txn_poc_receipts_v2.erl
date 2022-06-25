@@ -461,7 +461,8 @@ absorb(_POCVersion, Txn, Chain) ->
                        Ps;
                    {error, not_found} ->
                        lager:warning("potential replay: ~p not found", [OnionKeyHash]),
-                       throw(replay)
+                       ok
+                    %    throw(replay)
                end,
         case blockchain_ledger_poc_v3:verify(PoC, Challenger, BlockHash) of
             false ->
