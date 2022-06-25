@@ -461,8 +461,7 @@ absorb(_POCVersion, Txn, Chain) ->
                        Ps;
                    {error, not_found} ->
                        lager:warning("potential replay: ~p not found", [OnionKeyHash]),
-                       ok
-                    %    throw(replay)
+                       throw(ignore)
                end,
         case blockchain_ledger_poc_v3:verify(PoC, Challenger, BlockHash) of
             false ->
@@ -479,9 +478,11 @@ absorb(_POCVersion, Txn, Chain) ->
                         ok
                 end,
                 ok
-                % ok = blockchain_ledger_v1:delete_public_poc(OnionKeyHash, Ledger) - leave it to gc
+                % ok = blockchain_ledger_v1:delete_public_poc(OnionKeyHash, Ledger)
         end
-    catch throw:Reason ->
+    catch throw:ignore ->
+            ok;
+          throw:Reason ->
             {error, Reason};
           What:Why:Stacktrace ->
             lager:error([{poc_id, POCID}], "poc receipt calculation failed: ~p ~p ~p",
