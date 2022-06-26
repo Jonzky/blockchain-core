@@ -465,7 +465,7 @@ absorb(_POCVersion, Txn, Chain) ->
                end,
         case blockchain_ledger_poc_v3:verify(PoC, Challenger, BlockHash) of
             false ->
-                {error, invalid_poc};
+                ok;
             true ->
                 %% maybe update the last activity field for all challengees and GWs
                 %% participating in the POC
