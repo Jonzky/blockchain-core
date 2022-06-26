@@ -480,7 +480,7 @@ absorb(_POCVersion, Txn, Chain) ->
                 ok
                 % ok = blockchain_ledger_v1:delete_public_poc(OnionKeyHash, Ledger)
         end
-    catch throw:Reason ->
+    catch throw:_ ->
             ok;
           What:Why:Stacktrace ->
             lager:error([{poc_id, POCID}], "poc receipt calculation failed: ~p ~p ~p",
